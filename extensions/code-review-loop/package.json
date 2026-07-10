@@ -1,0 +1,14 @@
+{
+  "name": "@agentic-loops/code-review-loop",
+  "version": "1.0.0",
+  "description": "Pi extension: automated code review loop with sub-agent",
+  "main": "index.ts",
+  "type": "module",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "typebox": "^1.3.6"
+  }
+}

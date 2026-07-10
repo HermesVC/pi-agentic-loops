@@ -1,2 +1,18 @@
-/node_modules/
-package-lock.json
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Pi sessions (can be regenerated)
+.pi/sessions/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / cache
+dist/
+*.tsbuildinfo
