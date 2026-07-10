@@ -37,7 +37,7 @@ Text after the standalone `--` is passed as explicit review rules to every agent
 
 While the loop runs, Pi updates a live status line every five seconds. It shows the current stage, model-call number, elapsed time, and whether the sub-agent is thinking, reading, searching, editing, or running a command. The final report includes total and per-stage durations.
 
-The default model-call budget reserves one call for structured-output recovery. If any reviewer or verifier response has no valid JSON object, the loop retries that exact stage once with a stricter format instruction. The retry is visible in live progress and counts against the budget; a second malformed response stops with a diagnostic response preview.
+The default model-call budget reserves one call for structured-output recovery. If any reviewer or verifier response has no valid JSON object or finishes without final text, the loop retries that exact stage once with a stricter format instruction and thinking disabled so local reasoning models preserve output budget for JSON. The retry is visible in live progress and counts against the budget; a second failure reports the model, stop reason, content types, provider error, or a bounded response preview.
 
 ### Options
 

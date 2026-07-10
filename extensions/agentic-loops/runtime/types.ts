@@ -19,6 +19,7 @@ export interface SubagentRunOptions {
   onProgress?: (progress: SubagentProgress) => void;
   heartbeatMs?: number;
   model?: string;
+  thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
   tools?: string[];
   timeoutMs?: number;
 }

@@ -387,7 +387,14 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     verification: verificationRuns,
     rollbacks,
   });
-  const call = async (label: string, prompt: string, systemPrompt: string, tools: string[], model?: string) => {
+  const call = async (
+    label: string,
+    prompt: string,
+    systemPrompt: string,
+    tools: string[],
+    model?: string,
+    thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+  ) => {
     if (modelCalls >= maxCalls) throw new Error("MODEL_CALL_BUDGET_EXHAUSTED");
     modelCalls++;
     const callNumber = modelCalls;
@@ -395,7 +402,7 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     stage(`${label} | call ${callNumber}/${maxCalls} | starting`);
     try {
       return await runSubagent({
-        cwd, prompt, systemPrompt, tools, signal, timeoutMs, model,
+        cwd, prompt, systemPrompt, tools, signal, timeoutMs, model, thinkingLevel,
         onProgress: ({ activity, elapsedMs }) => {
           stage(`${label} | call ${callNumber}/${maxCalls} | ${activityLabel(activity)} | ${formatDuration(elapsedMs)}`);
         },
@@ -405,10 +412,16 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     }
   };
   const structuredCall = async (label: string, prompt: string, systemPrompt: string, tools: string[], model?: string): Promise<any> => {
-    const response = await call(label, prompt, systemPrompt, tools, model);
+    let response = "";
     try {
+      response = await call(label, prompt, systemPrompt, tools, model);
       return jsonFromResponse(response);
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const recoverable = message.startsWith("Agent returned no JSON object")
+        || message.startsWith("Agent returned invalid JSON object")
+        || message.startsWith("Subagent returned no final text");
+      if (!recoverable) throw error;
       if (structuredRecoveryUsed) throw error;
       structuredRecoveryUsed = true;
       stage(`${label} | invalid structured response | retrying once`);
@@ -416,9 +429,9 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
         prompt,
         "\n--- RESPONSE FORMAT RECOVERY ---",
         "Your previous attempt did not contain one valid JSON object. Repeat the task from the supplied evidence and return only the exact requested JSON object. Do not explain, apologize, or use prose outside JSON.",
-        `Previous invalid response:\n${response.slice(0, 4_000)}`,
+        `Previous failure:\n${response.slice(0, 4_000) || message}`,
       ].join("\n");
-      return jsonFromResponse(await call(`${label} JSON recovery`, recoveryPrompt, systemPrompt, tools, model));
+      return jsonFromResponse(await call(`${label} JSON recovery`, recoveryPrompt, systemPrompt, tools, model, "off"));
     }
   };
 
