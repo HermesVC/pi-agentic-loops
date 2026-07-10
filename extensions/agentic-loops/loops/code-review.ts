@@ -1,8 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { execFileSync } from "node:child_process";
+import { exec, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { isAbsolute, relative, resolve } from "node:path";
+import { promisify } from "node:util";
 import { runSubagent } from "../runtime/subagent.ts";
 
 const DEFAULT_MAX_DIFF_CHARS = 120_000;
@@ -11,7 +12,19 @@ const REVIEW_TOOLS = ["read", "grep", "find", "ls"];
 type FindingSeverity = "critical" | "high" | "medium" | "low";
 type FixSeverityPolicy = "all" | "medium_and_above" | "critical_only";
 type ReviewMode = "fast" | "strict";
-type LoopStatus = "clean" | "findings" | "policy_complete" | "no_progress" | "budget_exhausted" | "change_limit";
+type LoopStatus = "clean" | "findings" | "policy_complete" | "no_progress" | "budget_exhausted" | "change_limit" | "validation_failed";
+
+interface ValidationResult {
+  command: string;
+  passed: boolean;
+  exitCode: number | null;
+  output: string;
+}
+
+interface ValidationRun {
+  phase: string;
+  results: ValidationResult[];
+}
 
 interface Finding {
   id: string;
@@ -38,6 +51,8 @@ interface ReviewInput {
   maxModelCalls?: number;
   timeoutMinutes?: number;
   maxChangedLines?: number;
+  validationCommands?: string[];
+  validationTimeoutMinutes?: number;
 }
 
 interface VerificationResult {
@@ -55,8 +70,11 @@ interface LoopResult {
   unresolved: Finding[];
   durationMs: number;
   stages: Array<{ label: string; durationMs: number }>;
+  validation: ValidationRun[];
   summary?: string;
 }
+
+const execAsync = promisify(exec);
 
 function formatDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000));
@@ -77,6 +95,41 @@ function activityLabel(activity: string): string {
     bash: "running command",
   };
   return labels[activity] ?? `using ${activity}`;
+}
+
+async function runValidation(
+  cwd: string,
+  commands: string[],
+  phase: string,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  stage: (text: string) => void,
+): Promise<ValidationRun> {
+  const results: ValidationResult[] = [];
+  for (let index = 0; index < commands.length; index++) {
+    const command = commands[index];
+    signal?.throwIfAborted();
+    stage(`Validation ${phase} | command ${index + 1}/${commands.length} | ${command}`);
+    try {
+      const { stdout, stderr } = await execAsync(command, {
+        cwd,
+        timeout: timeoutMs,
+        maxBuffer: 10 * 1024 * 1024,
+        windowsHide: true,
+        signal,
+      });
+      results.push({ command, passed: true, exitCode: 0, output: `${stdout}${stderr}`.trim().slice(-4_000) });
+    } catch (error: any) {
+      signal?.throwIfAborted();
+      results.push({
+        command,
+        passed: false,
+        exitCode: typeof error?.code === "number" ? error.code : null,
+        output: `${error?.stdout ?? ""}${error?.stderr ?? error?.message ?? ""}`.trim().slice(-4_000),
+      });
+    }
+  }
+  return { phase, results };
 }
 
 function git(cwd: string, args: string[]): string {
@@ -241,14 +294,18 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   const maxCalls = input.maxModelCalls ?? (1 + (2 * maxFixRounds) + (mode === "strict" ? 2 : 0));
   const timeoutMs = (input.timeoutMinutes ?? 10) * 60_000;
   const maxLines = input.maxChangedLines ?? 2_000;
+  const validationCommands = input.validationCommands?.map((command) => command.trim()).filter(Boolean) ?? [];
+  const validationTimeoutMs = (input.validationTimeoutMinutes ?? 5) * 60_000;
   const policy = input.fixSeverity ?? "all";
   const allowedFiles = changedFiles(cwd, input);
   let modelCalls = 0;
   let fixRounds = 0;
+  const validation: ValidationRun[] = [];
   const finish = (result: Omit<LoopResult, "durationMs" | "stages">): LoopResult => ({
     ...result,
     durationMs: Date.now() - loopStartedAt,
     stages,
+    validation,
   });
   const call = async (label: string, prompt: string, systemPrompt: string, tools: string[]) => {
     if (modelCalls >= maxCalls) throw new Error("MODEL_CALL_BUDGET_EXHAUSTED");
@@ -282,6 +339,11 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   if (!(input.applyFixes ?? true)) return finish({ status: "findings", mode, modelCalls, fixRounds, findings, unresolved: findings });
   if (!selected.length) return finish({ status: "policy_complete", mode, modelCalls, fixRounds, findings, unresolved: findings });
 
+  const baseline = validationCommands.length
+    ? await runValidation(cwd, validationCommands, "baseline", validationTimeoutMs, signal, stage)
+    : undefined;
+  if (baseline) validation.push(baseline);
+
   let unresolved = selected;
   let previousFingerprint = createHash("sha256").update(collectGitDiff(cwd, input, false)).digest("hex");
   for (let round = 1; round <= maxFixRounds && unresolved.length; round++) {
@@ -298,6 +360,19 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     const currentFingerprint = createHash("sha256").update(fullDiff).digest("hex");
     if (currentFingerprint === previousFingerprint) return finish({ status: "no_progress", mode, modelCalls, fixRounds, findings, unresolved });
     previousFingerprint = currentFingerprint;
+
+    if (baseline) {
+      const afterFix = await runValidation(cwd, validationCommands, `after fix round ${round}`, validationTimeoutMs, signal, stage);
+      validation.push(afterFix);
+      const regressions = afterFix.results.filter((result, index) => !result.passed && baseline.results[index]?.passed);
+      if (regressions.length) {
+        return finish({
+          status: "validation_failed",
+          mode, modelCalls, fixRounds, findings, unresolved,
+          summary: `New validation regressions: ${regressions.map((result) => result.command).join(", ")}`,
+        });
+      }
+    }
 
     const verification = jsonFromResponse(await call("Verifying fixes", verifyPrompt(input, collectGitDiff(cwd, input), unresolved), REVIEWER_SYSTEM, REVIEW_TOOLS));
     const results: VerificationResult[] = Array.isArray(verification.results) ? verification.results : [];
@@ -323,6 +398,13 @@ function formatResult(result: LoopResult): string {
     `Unresolved findings: ${result.unresolved.length}`,
   ];
   if (result.stages.length) lines.push(`Stages: ${result.stages.map((item) => `${item.label} ${formatDuration(item.durationMs)}`).join("; ")}`);
+  for (const run of result.validation) {
+    const passed = run.results.filter((item) => item.passed).length;
+    lines.push(`Validation ${run.phase}: ${passed}/${run.results.length} passed`);
+    for (const item of run.results.filter((entry) => !entry.passed)) {
+      lines.push(`  FAIL: ${item.command}${item.output ? `\n${item.output}` : ""}`);
+    }
+  }
   if (result.summary) lines.push(`Summary: ${result.summary}`);
   if (result.unresolved.length) lines.push("", JSON.stringify({ findings: result.unresolved }, null, 2));
   return lines.join("\n");
@@ -336,6 +418,7 @@ function parseCommand(args: string): ReviewInput {
   const tokens = flagsPart.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^(?:"|')|(?:"|')$/g, "")) ?? [];
   const input: ReviewInput = {};
   const files: string[] = [];
+  const validationCommands: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i];
     const value = tokens[i + 1];
@@ -346,11 +429,14 @@ function parseCommand(args: string): ReviewInput {
     else if (token === "--timeout" && value) { input.timeoutMinutes = Number(value); i++; }
     else if (token === "--max-lines" && value) { input.maxChangedLines = Number(value); i++; }
     else if (token === "--base" && value) { input.base = value; i++; }
+    else if (token === "--validate" && value) { validationCommands.push(value); i++; }
+    else if (token === "--validation-timeout" && value) { input.validationTimeoutMinutes = Number(value); i++; }
     else if (token === "--review-only") input.applyFixes = false;
     else if (token.startsWith("--")) throw new Error(`Unknown option: ${token}`);
     else files.push(...token.split(",").filter(Boolean));
   }
   if (files.length) input.files = files;
+  if (validationCommands.length) input.validationCommands = validationCommands;
   if (rules) input.reviewRules = rules;
   return input;
 }
@@ -373,6 +459,8 @@ export function registerCodeReviewLoop(pi: ExtensionAPI): void {
       maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
       timeoutMinutes: Type.Optional(Type.Number({ minimum: 1, maximum: 30 })),
       maxChangedLines: Type.Optional(Type.Integer({ minimum: 1, maximum: 20_000 })),
+      validationCommands: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 10 })),
+      validationTimeoutMinutes: Type.Optional(Type.Number({ minimum: 0.1, maximum: 30 })),
     }),
     async execute(_id, params: ReviewInput, signal, onUpdate) {
       try {

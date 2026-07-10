@@ -18,6 +18,7 @@ full diff review -> fix confirmed findings -> targeted verification
 /code-review-loop
 /code-review-loop --severity critical_only
 /code-review-loop --mode fast --severity medium_and_above -- Ignore formatting
+/code-review-loop --severity critical_only --validate "npm test" --validate "npm run typecheck"
 ```
 
 ### Strict mode
@@ -46,6 +47,8 @@ While the loop runs, Pi updates a live status line every five seconds. It shows 
 - `--max-calls <number>`
 - `--timeout <minutes>` per sub-agent
 - `--max-lines <number>` total changed-line guard
+- `--validate <command>` repeatable deterministic validation command
+- `--validation-timeout <minutes>` per validation command (default: `5`)
 - positional file paths separated by spaces or commas
 
 Tool parameters mirror these options:
@@ -55,8 +58,11 @@ code_review_loop(
   task?, reviewRules?, files?, base?, maxDiffChars?,
   maxIterations?, applyFixes?, fixSeverity?, mode?,
   maxModelCalls?, timeoutMinutes?, maxChangedLines?
+  validationCommands?, validationTimeoutMinutes?
 )
 ```
+
+When validation commands are supplied, the loop runs them before the first fix as a baseline and after every fix round. A command that passed at baseline but fails afterward stops the loop with `VALIDATION_FAILED`; pre-existing failures are reported without being misclassified as regressions.
 
 The read-only agents have `read`, `grep`, `find`, and `ls` so they can verify repository contracts instead of guessing from the patch. The fixer is instructed to edit only files already present in the reviewed diff. The loop stops on no progress, model-call exhaustion, timeout, or change-limit violations.
 
