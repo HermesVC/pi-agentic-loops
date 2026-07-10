@@ -281,13 +281,14 @@ export function jsonFromResponse(text: string): any {
   const source = fenced ?? text;
   const start = source.indexOf("{");
   const end = source.lastIndexOf("}");
-  if (start < 0 || end < start) throw new Error("Agent returned no JSON object");
+  const preview = source.replace(/\s+/g, " ").trim().slice(0, 300) || "[empty response]";
+  if (start < 0 || end < start) throw new Error(`Agent returned no JSON object. Response preview: ${preview}`);
   const candidate = source.slice(start, end + 1);
   try {
     return JSON.parse(candidate);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    throw new Error(`Agent returned invalid JSON object: ${detail}`);
+    throw new Error(`Agent returned invalid JSON object: ${detail}. Response preview: ${preview}`);
   }
 }
 
@@ -309,10 +310,6 @@ function normalizeFindings(value: unknown): Finding[] {
       fix: String(raw.fix),
     }];
   });
-}
-
-function parseFindings(text: string): Finding[] {
-  return normalizeFindings(jsonFromResponse(text).findings);
 }
 
 function selectFindings(findings: Finding[], policy: FixSeverityPolicy): Finding[] {
@@ -369,7 +366,7 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   const stages: Array<{ label: string; durationMs: number }> = [];
   const mode = input.mode ?? "fast";
   const maxFixRounds = input.maxIterations ?? 1;
-  const maxCalls = input.maxModelCalls ?? (1 + (2 * maxFixRounds) + (mode === "strict" ? 2 : 0));
+  const maxCalls = input.maxModelCalls ?? (2 + (2 * maxFixRounds) + (mode === "strict" ? 2 : 0));
   const timeoutMs = (input.timeoutMinutes ?? 10) * 60_000;
   const maxLines = input.maxChangedLines ?? 2_000;
   const validationCommands = input.validationCommands?.map((command) => command.trim()).filter(Boolean) ?? [];
@@ -379,6 +376,7 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   let modelCalls = 0;
   let fixRounds = 0;
   let rollbacks = 0;
+  let structuredRecoveryUsed = false;
   const validation: ValidationRun[] = [];
   const verificationRuns: VerificationRun[] = [];
   const finish = (result: Omit<LoopResult, "durationMs" | "stages">): LoopResult => ({
@@ -406,14 +404,31 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
       stages.push({ label, durationMs: Date.now() - callStartedAt });
     }
   };
+  const structuredCall = async (label: string, prompt: string, systemPrompt: string, tools: string[], model?: string): Promise<any> => {
+    const response = await call(label, prompt, systemPrompt, tools, model);
+    try {
+      return jsonFromResponse(response);
+    } catch (error) {
+      if (structuredRecoveryUsed) throw error;
+      structuredRecoveryUsed = true;
+      stage(`${label} | invalid structured response | retrying once`);
+      const recoveryPrompt = [
+        prompt,
+        "\n--- RESPONSE FORMAT RECOVERY ---",
+        "Your previous attempt did not contain one valid JSON object. Repeat the task from the supplied evidence and return only the exact requested JSON object. Do not explain, apologize, or use prose outside JSON.",
+        `Previous invalid response:\n${response.slice(0, 4_000)}`,
+      ].join("\n");
+      return jsonFromResponse(await call(`${label} JSON recovery`, recoveryPrompt, systemPrompt, tools, model));
+    }
+  };
 
   const initialDiff = collectGitDiff(cwd, input);
-  let findings = parseFindings(await call("Reviewing", reviewPrompt(input, initialDiff), REVIEWER_SYSTEM, REVIEW_TOOLS));
+  let findings = normalizeFindings((await structuredCall("Reviewing", reviewPrompt(input, initialDiff), REVIEWER_SYSTEM, REVIEW_TOOLS)).findings);
   if (!findings.length) return finish({ status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] });
 
   if (mode === "strict") {
     const evidencePrompt = reviewPrompt(input, initialDiff, `evidence check for these candidate findings:\n${JSON.stringify(findings, null, 2)}`);
-    findings = parseFindings(await call("Checking evidence", evidencePrompt, REVIEWER_SYSTEM, REVIEW_TOOLS));
+    findings = normalizeFindings((await structuredCall("Checking evidence", evidencePrompt, REVIEWER_SYSTEM, REVIEW_TOOLS)).findings);
     if (!findings.length) return finish({ status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] });
   }
 
@@ -474,13 +489,13 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
       }
     }
 
-    const verificationResponse = jsonFromResponse(await call(
+    const verificationResponse = await structuredCall(
       "Independent verification",
       verifyPrompt(input, collectGitDiff(cwd, input), unresolved),
       VERIFIER_SYSTEM,
       ["read", "grep"],
       input.verifierModel,
-    ));
+    );
     const verdicts = new Set(["resolved", "unresolved", "inconclusive"]);
     const parsedResults: VerificationResult[] = Array.isArray(verificationResponse.results)
       ? verificationResponse.results.filter((result: any) => result?.id && verdicts.has(result?.verdict) && result?.evidence)
@@ -495,7 +510,7 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   }
 
   if (mode === "strict" && !unresolved.length) {
-    const finalFindings = parseFindings(await call("Final review", reviewPrompt(input, collectGitDiff(cwd, input), "final regression review"), REVIEWER_SYSTEM, REVIEW_TOOLS));
+    const finalFindings = normalizeFindings((await structuredCall("Final review", reviewPrompt(input, collectGitDiff(cwd, input), "final regression review"), REVIEWER_SYSTEM, REVIEW_TOOLS)).findings);
     if (finalFindings.length) return finish({ status: "findings", mode, modelCalls, fixRounds, findings, unresolved: finalFindings });
   }
 
