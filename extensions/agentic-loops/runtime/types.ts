@@ -9,4 +9,5 @@ export interface SubagentRunOptions {
   signal?: AbortSignal;
   onTextDelta?: (text: string) => void;
   tools?: string[];
+  timeoutMs?: number;
 }

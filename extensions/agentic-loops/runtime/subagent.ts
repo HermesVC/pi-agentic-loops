@@ -23,6 +23,9 @@ export async function runSubagent(options: SubagentRunOptions): Promise<string> 
       options.onTextDelta?.(event.assistantMessageEvent.delta);
     }
   });
+  const timeout = options.timeoutMs
+    ? setTimeout(() => void reviewer.session.abort(), options.timeoutMs)
+    : undefined;
 
   try {
     options.signal?.throwIfAborted();
@@ -43,6 +46,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<string> 
 
     return "[reviewer returned no text]";
   } finally {
+    if (timeout) clearTimeout(timeout);
     unsubscribe();
     reviewer.session.dispose();
   }

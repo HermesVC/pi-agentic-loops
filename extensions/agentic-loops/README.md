@@ -1,66 +1,77 @@
 # Agentic Loops for Pi
 
-An extensible Pi extension for workflows driven by specialized sub-agents. The first built-in loop is a Git-diff-focused code review.
+An extensible Pi extension for workflows driven by specialized sub-agents.
 
-## Available loops
+## Code review loop
 
-### `code-review`
+The code-review loop works on staged, unstaged, and untracked Git changes. It uses structured findings with stable IDs, severity, confidence, and verified evidence.
 
-Runs a closed `review -> fix -> verify` loop over staged, unstaged, and untracked changes. A read-only reviewer identifies actionable findings, then a separate fixer edits the working tree and runs focused validation. The loop reviews the new diff until it is clean, reaches its iteration limit, or detects that no progress was made.
+### Fast mode
 
-Tool:
+Default workflow with one fix round and three model calls:
 
 ```text
-code_review_loop(task?: string, reviewRules?: string, files?: string[], base?: string, maxDiffChars?: number, maxIterations?: number, applyFixes?: boolean, fixSeverity?: "all" | "medium_and_above" | "critical_only")
+full diff review -> fix confirmed findings -> targeted verification
 ```
-
-Commands:
 
 ```text
 /code-review-loop
 /code-review-loop --severity critical_only
-/code-review-loop --severity medium_and_above -- Ignore formatting; focus on API compatibility
-/code-review-loop --review-only src/index.ts src/api.ts -- Check error handling and race conditions
-/agentic-loop code-review --severity critical_only
-/agentic-loops
+/code-review-loop --mode fast --severity medium_and_above -- Ignore formatting
 ```
 
-Text after the standalone `--` is passed as `reviewRules` to both the reviewer and fixer. It is optional: reviewing the current Git diff is the loop's default behavior.
+### Strict mode
 
-Command options:
+Adds an independent evidence check and a final regression review:
 
-- `--severity all|medium_and_above|critical_only`
-- `--iterations 1..5`
+```text
+review -> evidence check -> fix -> targeted verification -> final review
+```
+
+```text
+/code-review-loop --mode strict --severity medium_and_above
+```
+
+Text after the standalone `--` is passed as explicit review rules to every agent.
+
+### Options
+
+- `--mode fast|strict` (default: `fast`)
+- `--severity all|medium_and_above|critical_only` (default: `all`)
+- `--iterations 1|2` (default: `1`)
 - `--review-only`
 - `--base <git-ref>`
-- positional file paths, separated by spaces or commas
+- `--max-calls <number>`
+- `--timeout <minutes>` per sub-agent
+- `--max-lines <number>` total changed-line guard
+- positional file paths separated by spaces or commas
 
-`base` defaults to `HEAD`. In a repository without a commit, staged and working-tree diffs are collected separately. Untracked files are represented as new-file patches. Diff input is capped at 120,000 characters by default. The loop performs up to three fix rounds and one final verification. Set `applyFixes: false` for review-only mode.
+Tool parameters mirror these options:
 
-`fixSeverity` controls what the fixer may change:
+```text
+code_review_loop(
+  task?, reviewRules?, files?, base?, maxDiffChars?,
+  maxIterations?, applyFixes?, fixSeverity?, mode?,
+  maxModelCalls?, timeoutMinutes?, maxChangedLines?
+)
+```
 
-- `all` fixes every finding (default)
-- `medium_and_above` fixes medium, high, and critical findings
-- `critical_only` fixes only critical findings
-
-The reviewer labels every finding as `CRITICAL`, `HIGH`, `MEDIUM`, or `LOW`. When findings remain but none are allowed by the selected policy, the loop stops with `POLICY_COMPLETE` and returns those findings without modifying them.
-
-Possible final statuses are `CLEAN`, `FINDINGS`, `POLICY_COMPLETE`, `NO_PROGRESS`, and `MAX_ITERATIONS`.
+The read-only agents have `read`, `grep`, `find`, and `ls` so they can verify repository contracts instead of guessing from the patch. The fixer is instructed to edit only files already present in the reviewed diff. The loop stops on no progress, model-call exhaustion, timeout, or change-limit violations.
 
 ## Architecture
 
 ```text
 index.ts                 loop catalog and extension entry point
-runtime/subagent.ts      shared isolated sub-agent runner
+runtime/subagent.ts      isolated sub-agent runner with timeout
 runtime/types.ts         shared loop contracts
-loops/code-review.ts     code-review registration and Git diff context
+loops/code-review.ts     structured review/fix/verify workflow
 ```
 
-Add a loop by exporting an `AgenticLoop` registrar from `loops/` and including it in the catalog in `index.ts`.
+Add a loop by exporting an `AgenticLoop` registrar from `loops/` and including it in `index.ts`.
 
 ## Local installation
 
-Point Pi at this directory, not at an npm `.tgz` file:
+Point Pi at the extension directory, never at an npm `.tgz` file:
 
 ```json
 {
