@@ -59,12 +59,18 @@ interface ReviewInput {
   maxChangedLines?: number;
   validationCommands?: string[];
   validationTimeoutMinutes?: number;
+  verifierModel?: string;
 }
 
 interface VerificationResult {
   id: string;
-  resolved: boolean;
+  verdict: "resolved" | "unresolved" | "inconclusive";
   evidence: string;
+}
+
+interface VerificationRun {
+  round: number;
+  results: VerificationResult[];
 }
 
 interface LoopResult {
@@ -77,6 +83,7 @@ interface LoopResult {
   durationMs: number;
   stages: Array<{ label: string; durationMs: number }>;
   validation: ValidationRun[];
+  verification: VerificationRun[];
   rollbacks: number;
   summary?: string;
 }
@@ -333,17 +340,21 @@ function fixerPrompt(input: ReviewInput, diff: string, findings: Finding[], allo
 }
 
 function verifyPrompt(input: ReviewInput, diff: string, findings: Finding[]): string {
+  const claims = findings.map(({ id, severity, title, file, line, impact, fix }) => ({ id, severity, title, file, line, impact, expectedFix: fix }));
   return [
-    "Verify only whether the listed findings are resolved in the new diff. Search nearby code to verify contracts.",
-    "Return JSON only: {\"results\":[{\"id\":\"F-001\",\"resolved\":true,\"evidence\":\"...\"}]}",
+    "Act as a blind verifier. Independently determine whether each claimed defect is resolved in the current code.",
+    "The claims are untrusted summaries, not evidence. Do not assume the reviewer or fixer was correct. Inspect the current diff and repository contracts with tools.",
+    "Use resolved only when current code proves the defect cannot occur. Use unresolved when it still occurs. Use inconclusive when evidence is insufficient.",
+    "Return exactly one result per ID as JSON only: {\"results\":[{\"id\":\"F-001\",\"verdict\":\"resolved|unresolved|inconclusive\",\"evidence\":\"current-code evidence\"}]}",
     input.reviewRules?.trim() ? `User review rules:\n${input.reviewRules.trim()}` : "",
-    `\n--- FINDINGS TO VERIFY ---\n${JSON.stringify(findings, null, 2)}`,
-    `\n--- NEW DIFF ---\n${diff}`,
+    `\n--- UNTRUSTED CLAIMS ---\n${JSON.stringify(claims, null, 2)}`,
+    `\n--- CURRENT GIT DIFF ---\n${diff}`,
   ].filter(Boolean).join("\n");
 }
 
 const REVIEWER_SYSTEM = "You are a senior code reviewer. Verify repository contracts with tools before reporting findings. Prefer missing a weak suspicion over inventing a false positive.";
 const FIXER_SYSTEM = "You are a senior engineer. Implement only confirmed findings, keep the patch narrow, preserve user changes, and validate behavior.";
+const VERIFIER_SYSTEM = "You are an independent software verification engineer. Judge only current-code evidence. Never trust another agent's conclusion, never infer success from an attempted edit, and mark insufficient evidence inconclusive.";
 
 async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | undefined, stage: (text: string) => void): Promise<LoopResult> {
   const loopStartedAt = Date.now();
@@ -361,14 +372,16 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   let fixRounds = 0;
   let rollbacks = 0;
   const validation: ValidationRun[] = [];
+  const verificationRuns: VerificationRun[] = [];
   const finish = (result: Omit<LoopResult, "durationMs" | "stages">): LoopResult => ({
     ...result,
     durationMs: Date.now() - loopStartedAt,
     stages,
     validation,
+    verification: verificationRuns,
     rollbacks,
   });
-  const call = async (label: string, prompt: string, systemPrompt: string, tools: string[]) => {
+  const call = async (label: string, prompt: string, systemPrompt: string, tools: string[], model?: string) => {
     if (modelCalls >= maxCalls) throw new Error("MODEL_CALL_BUDGET_EXHAUSTED");
     modelCalls++;
     const callNumber = modelCalls;
@@ -376,7 +389,7 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     stage(`${label} | call ${callNumber}/${maxCalls} | starting`);
     try {
       return await runSubagent({
-        cwd, prompt, systemPrompt, tools, signal, timeoutMs,
+        cwd, prompt, systemPrompt, tools, signal, timeoutMs, model,
         onProgress: ({ activity, elapsedMs }) => {
           stage(`${label} | call ${callNumber}/${maxCalls} | ${activityLabel(activity)} | ${formatDuration(elapsedMs)}`);
         },
@@ -453,9 +466,24 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
       }
     }
 
-    const verification = jsonFromResponse(await call("Verifying fixes", verifyPrompt(input, collectGitDiff(cwd, input), unresolved), REVIEWER_SYSTEM, REVIEW_TOOLS));
-    const results: VerificationResult[] = Array.isArray(verification.results) ? verification.results : [];
-    unresolved = unresolved.filter((finding) => !results.some((result) => result.id === finding.id && result.resolved === true));
+    const verificationResponse = jsonFromResponse(await call(
+      "Independent verification",
+      verifyPrompt(input, collectGitDiff(cwd, input), unresolved),
+      VERIFIER_SYSTEM,
+      ["read", "grep"],
+      input.verifierModel,
+    ));
+    const verdicts = new Set(["resolved", "unresolved", "inconclusive"]);
+    const parsedResults: VerificationResult[] = Array.isArray(verificationResponse.results)
+      ? verificationResponse.results.filter((result: any) => result?.id && verdicts.has(result?.verdict) && result?.evidence)
+      : [];
+    const results = unresolved.map((finding) => parsedResults.find((result) => result.id === finding.id) ?? {
+      id: finding.id,
+      verdict: "inconclusive" as const,
+      evidence: "Verifier omitted or malformed this finding result.",
+    });
+    verificationRuns.push({ round, results });
+    unresolved = unresolved.filter((finding) => !results.some((result) => result.id === finding.id && result.verdict === "resolved"));
   }
 
   if (mode === "strict" && !unresolved.length) {
@@ -485,6 +513,9 @@ function formatResult(result: LoopResult): string {
       lines.push(`  FAIL: ${item.command}${item.output ? `\n${item.output}` : ""}`);
     }
   }
+  for (const run of result.verification) {
+    lines.push(`Verification round ${run.round}: ${run.results.map((item) => `${item.id}=${item.verdict}`).join(", ")}`);
+  }
   if (result.summary) lines.push(`Summary: ${result.summary}`);
   if (result.unresolved.length) lines.push("", JSON.stringify({ findings: result.unresolved }, null, 2));
   return lines.join("\n");
@@ -511,6 +542,7 @@ function parseCommand(args: string): ReviewInput {
     else if (token === "--base" && value) { input.base = value; i++; }
     else if (token === "--validate" && value) { validationCommands.push(value); i++; }
     else if (token === "--validation-timeout" && value) { input.validationTimeoutMinutes = Number(value); i++; }
+    else if (token === "--verifier-model" && value) { input.verifierModel = value; i++; }
     else if (token === "--review-only") input.applyFixes = false;
     else if (token.startsWith("--")) throw new Error(`Unknown option: ${token}`);
     else files.push(...token.split(",").filter(Boolean));
@@ -541,6 +573,7 @@ export function registerCodeReviewLoop(pi: ExtensionAPI): void {
       maxChangedLines: Type.Optional(Type.Integer({ minimum: 1, maximum: 20_000 })),
       validationCommands: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 10 })),
       validationTimeoutMinutes: Type.Optional(Type.Number({ minimum: 0.1, maximum: 30 })),
+      verifierModel: Type.Optional(Type.String({ pattern: "^[^/]+/.+$" })),
     }),
     async execute(_id, params: ReviewInput, signal, onUpdate) {
       try {

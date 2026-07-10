@@ -13,12 +13,20 @@ export async function runSubagent(options: SubagentRunOptions): Promise<string> 
     options.onProgress?.({ kind, activity, toolName, elapsedMs: Date.now() - startedAt, isError });
   const authStorage = AuthStorage.create();
   const modelRegistry = ModelRegistry.create(authStorage);
+  const separator = options.model?.indexOf("/") ?? -1;
+  const model = options.model
+    ? modelRegistry.find(options.model.slice(0, separator), options.model.slice(separator + 1))
+    : undefined;
+  if (options.model && (separator < 1 || !model)) {
+    throw new Error(`Verifier model is unavailable; expected provider/model, got: ${options.model}`);
+  }
   const reviewer = await createAgentSession({
     cwd: options.cwd,
     systemPromptOverride: () => options.systemPrompt,
     tools: options.tools ?? ["read"],
     authStorage,
     modelRegistry,
+    model,
     sessionManager: SessionManager.inMemory(options.cwd),
   });
 

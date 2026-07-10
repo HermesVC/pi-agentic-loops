@@ -18,6 +18,7 @@ export interface SubagentRunOptions {
   onTextDelta?: (text: string) => void;
   onProgress?: (progress: SubagentProgress) => void;
   heartbeatMs?: number;
+  model?: string;
   tools?: string[];
   timeoutMs?: number;
 }
