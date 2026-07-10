@@ -34,6 +34,8 @@ review -> evidence check -> fix -> targeted verification -> final review
 
 Text after the standalone `--` is passed as explicit review rules to every agent.
 
+While the loop runs, Pi updates a live status line every five seconds. It shows the current stage, model-call number, elapsed time, and whether the sub-agent is thinking, reading, searching, editing, or running a command. The final report includes total and per-stage durations.
+
 ### Options
 
 - `--mode fast|strict` (default: `fast`)

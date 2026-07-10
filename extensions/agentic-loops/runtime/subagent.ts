@@ -7,6 +7,10 @@ import {
 import type { SubagentRunOptions } from "./types.ts";
 
 export async function runSubagent(options: SubagentRunOptions): Promise<string> {
+  const startedAt = Date.now();
+  let activity = "thinking";
+  const progress = (kind: "thinking" | "tool_start" | "tool_end" | "heartbeat", toolName?: string, isError?: boolean) =>
+    options.onProgress?.({ kind, activity, toolName, elapsedMs: Date.now() - startedAt, isError });
   const authStorage = AuthStorage.create();
   const modelRegistry = ModelRegistry.create(authStorage);
   const reviewer = await createAgentSession({
@@ -20,9 +24,18 @@ export async function runSubagent(options: SubagentRunOptions): Promise<string> 
 
   const unsubscribe = reviewer.session.subscribe((event: any) => {
     if (event.type === "message_update" && event.assistantMessageEvent?.type === "text_delta") {
+      activity = "thinking";
       options.onTextDelta?.(event.assistantMessageEvent.delta);
+    } else if (event.type === "tool_execution_start") {
+      activity = event.toolName || "tool";
+      progress("tool_start", event.toolName);
+    } else if (event.type === "tool_execution_end") {
+      progress("tool_end", event.toolName, event.isError);
+      activity = "thinking";
     }
   });
+  progress("thinking");
+  const heartbeat = setInterval(() => progress("heartbeat"), options.heartbeatMs ?? 5_000);
   const timeout = options.timeoutMs
     ? setTimeout(() => void reviewer.session.abort(), options.timeoutMs)
     : undefined;
@@ -46,6 +59,7 @@ export async function runSubagent(options: SubagentRunOptions): Promise<string> 
 
     return "[reviewer returned no text]";
   } finally {
+    clearInterval(heartbeat);
     if (timeout) clearTimeout(timeout);
     unsubscribe();
     reviewer.session.dispose();

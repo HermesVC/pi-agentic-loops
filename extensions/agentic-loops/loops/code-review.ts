@@ -53,7 +53,30 @@ interface LoopResult {
   fixRounds: number;
   findings: Finding[];
   unresolved: Finding[];
+  durationMs: number;
+  stages: Array<{ label: string; durationMs: number }>;
   summary?: string;
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes ? `${minutes}m ${String(seconds).padStart(2, "0")}s` : `${seconds}s`;
+}
+
+function activityLabel(activity: string): string {
+  const labels: Record<string, string> = {
+    thinking: "thinking",
+    read: "reading files",
+    grep: "searching code",
+    find: "finding files",
+    ls: "listing files",
+    edit: "editing code",
+    write: "writing files",
+    bash: "running command",
+  };
+  return labels[activity] ?? `using ${activity}`;
 }
 
 function git(cwd: string, args: string[]): string {
@@ -211,6 +234,8 @@ const REVIEWER_SYSTEM = "You are a senior code reviewer. Verify repository contr
 const FIXER_SYSTEM = "You are a senior engineer. Implement only confirmed findings, keep the patch narrow, preserve user changes, and validate behavior.";
 
 async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | undefined, stage: (text: string) => void): Promise<LoopResult> {
+  const loopStartedAt = Date.now();
+  const stages: Array<{ label: string; durationMs: number }> = [];
   const mode = input.mode ?? "fast";
   const maxFixRounds = input.maxIterations ?? 1;
   const maxCalls = input.maxModelCalls ?? (1 + (2 * maxFixRounds) + (mode === "strict" ? 2 : 0));
@@ -220,26 +245,42 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   const allowedFiles = changedFiles(cwd, input);
   let modelCalls = 0;
   let fixRounds = 0;
+  const finish = (result: Omit<LoopResult, "durationMs" | "stages">): LoopResult => ({
+    ...result,
+    durationMs: Date.now() - loopStartedAt,
+    stages,
+  });
   const call = async (label: string, prompt: string, systemPrompt: string, tools: string[]) => {
     if (modelCalls >= maxCalls) throw new Error("MODEL_CALL_BUDGET_EXHAUSTED");
     modelCalls++;
-    stage(`${label} (${modelCalls}/${maxCalls})`);
-    return runSubagent({ cwd, prompt, systemPrompt, tools, signal, timeoutMs });
+    const callNumber = modelCalls;
+    const callStartedAt = Date.now();
+    stage(`${label} | call ${callNumber}/${maxCalls} | starting`);
+    try {
+      return await runSubagent({
+        cwd, prompt, systemPrompt, tools, signal, timeoutMs,
+        onProgress: ({ activity, elapsedMs }) => {
+          stage(`${label} | call ${callNumber}/${maxCalls} | ${activityLabel(activity)} | ${formatDuration(elapsedMs)}`);
+        },
+      });
+    } finally {
+      stages.push({ label, durationMs: Date.now() - callStartedAt });
+    }
   };
 
   const initialDiff = collectGitDiff(cwd, input);
   let findings = parseFindings(await call("Reviewing", reviewPrompt(input, initialDiff), REVIEWER_SYSTEM, REVIEW_TOOLS));
-  if (!findings.length) return { status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] };
+  if (!findings.length) return finish({ status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] });
 
   if (mode === "strict") {
     const evidencePrompt = reviewPrompt(input, initialDiff, `evidence check for these candidate findings:\n${JSON.stringify(findings, null, 2)}`);
     findings = parseFindings(await call("Checking evidence", evidencePrompt, REVIEWER_SYSTEM, REVIEW_TOOLS));
-    if (!findings.length) return { status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] };
+    if (!findings.length) return finish({ status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] });
   }
 
   const selected = selectFindings(findings, policy);
-  if (!(input.applyFixes ?? true)) return { status: "findings", mode, modelCalls, fixRounds, findings, unresolved: findings };
-  if (!selected.length) return { status: "policy_complete", mode, modelCalls, fixRounds, findings, unresolved: findings };
+  if (!(input.applyFixes ?? true)) return finish({ status: "findings", mode, modelCalls, fixRounds, findings, unresolved: findings });
+  if (!selected.length) return finish({ status: "policy_complete", mode, modelCalls, fixRounds, findings, unresolved: findings });
 
   let unresolved = selected;
   let previousFingerprint = createHash("sha256").update(collectGitDiff(cwd, input, false)).digest("hex");
@@ -250,12 +291,12 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
 
     const currentFiles = changedFiles(cwd, input);
     const outside = currentFiles.filter((file) => !allowedFiles.includes(file));
-    if (outside.length) return { status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Fixer changed files outside the initial diff: ${outside.join(", ")}` };
-    if (changedLineCount(cwd, input) > maxLines) return { status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Diff exceeds ${maxLines} changed lines` };
+    if (outside.length) return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Fixer changed files outside the initial diff: ${outside.join(", ")}` });
+    if (changedLineCount(cwd, input) > maxLines) return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Diff exceeds ${maxLines} changed lines` });
 
     const fullDiff = collectGitDiff(cwd, input, false);
     const currentFingerprint = createHash("sha256").update(fullDiff).digest("hex");
-    if (currentFingerprint === previousFingerprint) return { status: "no_progress", mode, modelCalls, fixRounds, findings, unresolved };
+    if (currentFingerprint === previousFingerprint) return finish({ status: "no_progress", mode, modelCalls, fixRounds, findings, unresolved });
     previousFingerprint = currentFingerprint;
 
     const verification = jsonFromResponse(await call("Verifying fixes", verifyPrompt(input, collectGitDiff(cwd, input), unresolved), REVIEWER_SYSTEM, REVIEW_TOOLS));
@@ -265,10 +306,10 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
 
   if (mode === "strict" && !unresolved.length) {
     const finalFindings = parseFindings(await call("Final review", reviewPrompt(input, collectGitDiff(cwd, input), "final regression review"), REVIEWER_SYSTEM, REVIEW_TOOLS));
-    if (finalFindings.length) return { status: "findings", mode, modelCalls, fixRounds, findings, unresolved: finalFindings };
+    if (finalFindings.length) return finish({ status: "findings", mode, modelCalls, fixRounds, findings, unresolved: finalFindings });
   }
 
-  return { status: unresolved.length ? "findings" : "clean", mode, modelCalls, fixRounds, findings, unresolved };
+  return finish({ status: unresolved.length ? "findings" : "clean", mode, modelCalls, fixRounds, findings, unresolved });
 }
 
 function formatResult(result: LoopResult): string {
@@ -277,9 +318,11 @@ function formatResult(result: LoopResult): string {
     `Mode: ${result.mode}`,
     `Model calls: ${result.modelCalls}`,
     `Fix rounds: ${result.fixRounds}`,
+    `Total duration: ${formatDuration(result.durationMs)}`,
     `Initial findings: ${result.findings.length}`,
     `Unresolved findings: ${result.unresolved.length}`,
   ];
+  if (result.stages.length) lines.push(`Stages: ${result.stages.map((item) => `${item.label} ${formatDuration(item.durationMs)}`).join("; ")}`);
   if (result.summary) lines.push(`Summary: ${result.summary}`);
   if (result.unresolved.length) lines.push("", JSON.stringify({ findings: result.unresolved }, null, 2));
   return lines.join("\n");
