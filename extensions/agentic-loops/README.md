@@ -64,6 +64,8 @@ code_review_loop(
 
 When validation commands are supplied, the loop runs them before the first fix as a baseline and after every fix round. A command that passed at baseline but fails afterward stops the loop with `VALIDATION_FAILED`; pre-existing failures are reported without being misclassified as regressions.
 
+Each fix round is transactional for the reviewed working-tree files. The loop restores the pre-round bytes when the fixer times out, is cancelled, edits files outside the initial diff, exceeds the changed-line limit, or introduces a new validation regression. Successful rounds remain in the working tree. The fixer is forbidden from staging or committing changes so the user's index is left alone.
+
 The read-only agents have `read`, `grep`, `find`, and `ls` so they can verify repository contracts instead of guessing from the patch. The fixer is instructed to edit only files already present in the reviewed diff. The loop stops on no progress, model-call exhaustion, timeout, or change-limit violations.
 
 ## Architecture

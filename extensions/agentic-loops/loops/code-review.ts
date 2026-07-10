@@ -2,7 +2,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { exec, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { isAbsolute, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { promisify } from "node:util";
 import { runSubagent } from "../runtime/subagent.ts";
 
@@ -24,6 +25,11 @@ interface ValidationResult {
 interface ValidationRun {
   phase: string;
   results: ValidationResult[];
+}
+
+interface RoundSnapshot {
+  root: string;
+  files: Map<string, Buffer | null>;
 }
 
 interface Finding {
@@ -71,6 +77,7 @@ interface LoopResult {
   durationMs: number;
   stages: Array<{ label: string; durationMs: number }>;
   validation: ValidationRun[];
+  rollbacks: number;
   summary?: string;
 }
 
@@ -210,6 +217,58 @@ function changedLineCount(cwd: string, input: ReviewInput): number {
   }, 0);
 }
 
+function captureRoundSnapshot(cwd: string, files: string[]): RoundSnapshot {
+  const root = repoRoot(cwd);
+  const snapshots = new Map<string, Buffer | null>();
+  for (const file of files) {
+    const absolute = resolve(root, file);
+    snapshots.set(file, existsSync(absolute) ? readFileSync(absolute) : null);
+  }
+  return { root, files: snapshots };
+}
+
+function restoreRoundSnapshot(snapshot: RoundSnapshot, currentChangedFiles: string[]): void {
+  const paths = new Set([...snapshot.files.keys(), ...currentChangedFiles]);
+  for (const file of paths) {
+    const absolute = resolve(snapshot.root, file);
+    if (snapshot.files.has(file)) {
+      const saved = snapshot.files.get(file);
+      if (saved === null) {
+        rmSync(absolute, { force: true });
+        continue;
+      }
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, saved);
+      continue;
+    }
+    try {
+      const original = execFileSync("git", ["show", `HEAD:${file}`], {
+        cwd: snapshot.root,
+        encoding: "buffer",
+        maxBuffer: 20 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      mkdirSync(dirname(absolute), { recursive: true });
+      writeFileSync(absolute, original);
+    } catch {
+      rmSync(absolute, { force: true });
+    }
+  }
+}
+
+function changedOutsideAllowed(snapshot: RoundSnapshot, currentFiles: string[], allowedFiles: string[]): string[] {
+  const allowed = new Set(allowedFiles);
+  return currentFiles.filter((file) => {
+    if (allowed.has(file)) return false;
+    const hasSaved = snapshot.files.has(file);
+    const saved = snapshot.files.get(file);
+    const absolute = resolve(snapshot.root, file);
+    if (!hasSaved) return true;
+    if (saved === null) return existsSync(absolute);
+    return !existsSync(absolute) || !saved.equals(readFileSync(absolute));
+  });
+}
+
 function jsonFromResponse(text: string): any {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
   const candidate = fenced ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
@@ -266,7 +325,7 @@ function fixerPrompt(input: ReviewInput, diff: string, findings: Finding[], allo
     `Task context: ${input.task?.trim() || "Fix reviewed changes"}`,
     input.reviewRules?.trim() ? `User constraints:\n${input.reviewRules.trim()}` : "",
     `Allowed files (do not edit anything else):\n${allowedFiles.join("\n")}`,
-    "Implement only the supplied findings. Preserve unrelated changes. Run focused validation when practical.",
+    "Implement only the supplied findings. Preserve unrelated changes. Do not stage or commit files. Run focused validation when practical.",
     "Return a concise summary of edits and validation.",
     `\n--- CONFIRMED FINDINGS ---\n${JSON.stringify(findings, null, 2)}`,
     `\n--- CURRENT DIFF ---\n${diff}`,
@@ -300,12 +359,14 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   const allowedFiles = changedFiles(cwd, input);
   let modelCalls = 0;
   let fixRounds = 0;
+  let rollbacks = 0;
   const validation: ValidationRun[] = [];
   const finish = (result: Omit<LoopResult, "durationMs" | "stages">): LoopResult => ({
     ...result,
     durationMs: Date.now() - loopStartedAt,
     stages,
     validation,
+    rollbacks,
   });
   const call = async (label: string, prompt: string, systemPrompt: string, tools: string[]) => {
     if (modelCalls >= maxCalls) throw new Error("MODEL_CALL_BUDGET_EXHAUSTED");
@@ -349,12 +410,29 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   for (let round = 1; round <= maxFixRounds && unresolved.length; round++) {
     fixRounds = round;
     const before = collectGitDiff(cwd, input);
-    await call(`Fixing round ${round}`, fixerPrompt(input, before, unresolved, allowedFiles), FIXER_SYSTEM, ["read", "grep", "find", "ls", "edit", "write", "bash"]);
+    const snapshot = captureRoundSnapshot(cwd, changedFiles(cwd, {}));
+    const rollback = () => {
+      restoreRoundSnapshot(snapshot, changedFiles(cwd, {}));
+      rollbacks++;
+      stage(`Fixing round ${round} | rolled back to pre-round state`);
+    };
+    try {
+      await call(`Fixing round ${round}`, fixerPrompt(input, before, unresolved, allowedFiles), FIXER_SYSTEM, ["read", "grep", "find", "ls", "edit", "write", "bash"]);
+    } catch (error) {
+      rollback();
+      throw error;
+    }
 
-    const currentFiles = changedFiles(cwd, input);
-    const outside = currentFiles.filter((file) => !allowedFiles.includes(file));
-    if (outside.length) return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Fixer changed files outside the initial diff: ${outside.join(", ")}` });
-    if (changedLineCount(cwd, input) > maxLines) return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Diff exceeds ${maxLines} changed lines` });
+    const currentFiles = changedFiles(cwd, {});
+    const outside = changedOutsideAllowed(snapshot, currentFiles, allowedFiles);
+    if (outside.length) {
+      rollback();
+      return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Rolled back fixer changes outside the initial diff: ${outside.join(", ")}` });
+    }
+    if (changedLineCount(cwd, input) > maxLines) {
+      rollback();
+      return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Rolled back fixer diff exceeding ${maxLines} changed lines` });
+    }
 
     const fullDiff = collectGitDiff(cwd, input, false);
     const currentFingerprint = createHash("sha256").update(fullDiff).digest("hex");
@@ -366,10 +444,11 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
       validation.push(afterFix);
       const regressions = afterFix.results.filter((result, index) => !result.passed && baseline.results[index]?.passed);
       if (regressions.length) {
+        rollback();
         return finish({
           status: "validation_failed",
           mode, modelCalls, fixRounds, findings, unresolved,
-          summary: `New validation regressions: ${regressions.map((result) => result.command).join(", ")}`,
+          summary: `Rolled back new validation regressions: ${regressions.map((result) => result.command).join(", ")}`,
         });
       }
     }
@@ -393,6 +472,7 @@ function formatResult(result: LoopResult): string {
     `Mode: ${result.mode}`,
     `Model calls: ${result.modelCalls}`,
     `Fix rounds: ${result.fixRounds}`,
+    `Rolled back rounds: ${result.rollbacks}`,
     `Total duration: ${formatDuration(result.durationMs)}`,
     `Initial findings: ${result.findings.length}`,
     `Unresolved findings: ${result.unresolved.length}`,
