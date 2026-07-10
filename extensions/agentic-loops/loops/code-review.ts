@@ -276,11 +276,19 @@ function changedOutsideAllowed(snapshot: RoundSnapshot, currentFiles: string[], 
   });
 }
 
-function jsonFromResponse(text: string): any {
-  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1];
-  const candidate = fenced ?? text.slice(text.indexOf("{"), text.lastIndexOf("}") + 1);
-  if (!candidate) throw new Error("Agent returned no JSON object");
-  return JSON.parse(candidate);
+export function jsonFromResponse(text: string): any {
+  const fenced = text.match(/```(?:[a-z][\w+-]*)?\s*([\s\S]*?)```/i)?.[1];
+  const source = fenced ?? text;
+  const start = source.indexOf("{");
+  const end = source.lastIndexOf("}");
+  if (start < 0 || end < start) throw new Error("Agent returned no JSON object");
+  const candidate = source.slice(start, end + 1);
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Agent returned invalid JSON object: ${detail}`);
+  }
 }
 
 function normalizeFindings(value: unknown): Finding[] {
