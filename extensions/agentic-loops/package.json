@@ -1,7 +1,7 @@
 {
-  "name": "@agentic-loops/code-review-loop",
-  "version": "1.0.0",
-  "description": "Pi extension: automated code review loop with sub-agent",
+  "name": "@agentic-loops/pi-agentic-loops",
+  "version": "2.0.0",
+  "description": "Extensible agentic loops for Pi",
   "main": "index.ts",
   "type": "module",
   "pi": {
