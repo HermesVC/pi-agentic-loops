@@ -11,17 +11,29 @@ Runs a closed `review -> fix -> verify` loop over staged, unstaged, and untracke
 Tool:
 
 ```text
-code_review_loop(task: string, files?: string[], base?: string, maxDiffChars?: number, maxIterations?: number, applyFixes?: boolean, fixSeverity?: "all" | "medium_and_above" | "critical_only")
+code_review_loop(task?: string, reviewRules?: string, files?: string[], base?: string, maxDiffChars?: number, maxIterations?: number, applyFixes?: boolean, fixSeverity?: "all" | "medium_and_above" | "critical_only")
 ```
 
 Commands:
 
 ```text
-/code-review-loop -- explain the current changes
-/code-review-loop src/index.ts src/api.ts -- review error handling
-/agentic-loop code-review -- review all current changes
+/code-review-loop
+/code-review-loop --severity critical_only
+/code-review-loop --severity medium_and_above -- Ignore formatting; focus on API compatibility
+/code-review-loop --review-only src/index.ts src/api.ts -- Check error handling and race conditions
+/agentic-loop code-review --severity critical_only
 /agentic-loops
 ```
+
+Text after the standalone `--` is passed as `reviewRules` to both the reviewer and fixer. It is optional: reviewing the current Git diff is the loop's default behavior.
+
+Command options:
+
+- `--severity all|medium_and_above|critical_only`
+- `--iterations 1..5`
+- `--review-only`
+- `--base <git-ref>`
+- positional file paths, separated by spaces or commas
 
 `base` defaults to `HEAD`. In a repository without a commit, staged and working-tree diffs are collected separately. Untracked files are represented as new-file patches. Diff input is capped at 120,000 characters by default. The loop performs up to three fix rounds and one final verification. Set `applyFixes: false` for review-only mode.
 

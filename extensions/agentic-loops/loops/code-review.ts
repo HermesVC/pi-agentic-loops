@@ -10,7 +10,8 @@ const DEFAULT_MAX_ITERATIONS = 3;
 
 interface ReviewInput {
   files?: string[];
-  task: string;
+  task?: string;
+  reviewRules?: string;
   base?: string;
   maxDiffChars?: number;
   maxIterations?: number;
@@ -94,7 +95,8 @@ export function collectGitDiff(cwd: string, input: ReviewInput): string {
 
 function buildReviewPrompt(input: ReviewInput, diff: string, iteration: number): string {
   return [
-    `Task context: ${input.task}`,
+    `Task context: ${input.task?.trim() || "Review current changes"}`,
+    input.reviewRules?.trim() ? `User review rules (follow these unless they conflict with safety):\n${input.reviewRules.trim()}` : "",
     `Review iteration: ${iteration}`,
     "Review the Git diff below. Treat unchanged files only as optional context and use the read tool sparingly.",
     "Prioritize behavioral bugs, regressions, security issues, data loss, broken contracts, and missing tests.",
@@ -104,12 +106,13 @@ function buildReviewPrompt(input: ReviewInput, diff: string, iteration: number):
     "If there are no actionable findings, answer exactly: NO_FINDINGS",
     "\n--- GIT DIFF ---\n",
     diff,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 function buildFixPrompt(input: ReviewInput, diff: string, findings: string, iteration: number): string {
   return [
-    `Task context: ${input.task}`,
+    `Task context: ${input.task?.trim() || "Review current changes"}`,
+    input.reviewRules?.trim() ? `User review rules and constraints:\n${input.reviewRules.trim()}` : "",
     `Fix iteration: ${iteration}`,
     "Fix every actionable review finding that is supported by the code.",
     "Keep changes narrowly scoped. Preserve unrelated user changes and never revert the working tree.",
@@ -119,7 +122,7 @@ function buildFixPrompt(input: ReviewInput, diff: string, findings: string, iter
     findings,
     "\n--- CURRENT GIT DIFF ---\n",
     diff,
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 const REVIEWER_PROMPT = [
@@ -257,7 +260,8 @@ export function registerCodeReviewLoop(pi: ExtensionAPI): void {
     label: "Code Review Loop",
     description: "Runs a Git-diff review, fix, and verify loop with isolated reviewer and fixer agents.",
     parameters: Type.Object({
-      task: Type.String({ description: "What changed and why" }),
+      task: Type.Optional(Type.String({ description: "Optional context about what changed and why" })),
+      reviewRules: Type.Optional(Type.String({ description: "Additional review rules passed explicitly to reviewer and fixer" })),
       files: Type.Optional(Type.Array(Type.String(), { description: "Optional files to include; defaults to all changed files" })),
       base: Type.Optional(Type.String({ description: "Git base revision; defaults to HEAD" })),
       maxDiffChars: Type.Optional(Type.Number({ minimum: 10_000, maximum: 500_000 })),
@@ -289,20 +293,57 @@ export function registerCodeReviewLoop(pi: ExtensionAPI): void {
       ctx.ui.notify("Agent is busy. Run the review when it is idle.", "warning");
       return;
     }
-    const [filesPart, ...taskParts] = args.split("--");
-    const files = filesPart.split(/[,\r\n\s]+/).map((file) => file.trim()).filter(Boolean);
-    const task = taskParts.join("--").trim() || "Review and fix current changes";
-    const payload = files.length ? { files, task, applyFixes: true } : { task, applyFixes: true };
+    const separator = args.match(/(?:^|\s)--(?:\s|$)/);
+    const separatorIndex = separator?.index ?? -1;
+    const flagsPart = separatorIndex >= 0 ? args.slice(0, separatorIndex).trim() : args.trim();
+    const reviewRules = separatorIndex >= 0 ? args.slice(separatorIndex + separator![0].length).trim() : "";
+    const tokens = flagsPart.match(/"[^"]*"|'[^']*'|\S+/g)?.map((token) => token.replace(/^(?:"|')|(?:"|')$/g, "")) ?? [];
+    const payload: ReviewInput = { applyFixes: true };
+    const files: string[] = [];
+
+    for (let index = 0; index < tokens.length; index++) {
+      const token = tokens[index];
+      const value = tokens[index + 1];
+      if (token === "--severity" && value) {
+        if (!["all", "medium_and_above", "critical_only"].includes(value)) {
+          ctx.ui.notify("Severity must be: all, medium_and_above, or critical_only", "warning");
+          return;
+        }
+        payload.fixSeverity = value as FixSeverityPolicy;
+        index++;
+      } else if (token === "--iterations" && value) {
+        const iterations = Number(value);
+        if (!Number.isInteger(iterations) || iterations < 1 || iterations > 5) {
+          ctx.ui.notify("Iterations must be an integer from 1 to 5", "warning");
+          return;
+        }
+        payload.maxIterations = iterations;
+        index++;
+      } else if (token === "--base" && value) {
+        payload.base = value;
+        index++;
+      } else if (token === "--review-only") {
+        payload.applyFixes = false;
+      } else if (token.startsWith("--")) {
+        ctx.ui.notify(`Unknown option: ${token}`, "warning");
+        return;
+      } else {
+        files.push(...token.split(",").filter(Boolean));
+      }
+    }
+
+    if (files.length) payload.files = files;
+    if (reviewRules) payload.reviewRules = reviewRules;
     pi.sendUserMessage(`Call code_review_loop with ${JSON.stringify(payload)} and report the final loop status.`);
   };
 
   pi.registerCommand("code-review-loop", {
-    description: "Review, fix, and verify Git diff: /code-review-loop [files] -- task",
+    description: "Review and fix changes: /code-review-loop [options] [files] -- review rules",
     handler: sendReview,
   });
 
   pi.registerCommand("agentic-loop", {
-    description: "Run a loop: /agentic-loop code-review [files] -- task",
+    description: "Run a loop: /agentic-loop code-review [options] [files] -- review rules",
     handler: async (args, ctx) => {
       const [name, ...rest] = args.trim().split(/\s+/);
       if (name !== "code-review") {
