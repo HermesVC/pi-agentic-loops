@@ -150,6 +150,19 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
     );
   };
 
+  const approveLatestPlan = (ctx: ExtensionContext): boolean => {
+    if (state.phase !== "planning" && state.phase !== "ready") return false;
+    const plan = parsePlan(lastAssistantText(ctx));
+    if (plan.length === 0) return false;
+    state.plan = plan;
+    state.currentStep = 0;
+    state.phase = "ready";
+    persist();
+    updateUi(ctx);
+    startCurrentStep(ctx);
+    return true;
+  };
+
   pi.registerCommand("guided", {
     description: "Start an interactive, one-step-at-a-time implementation",
     handler: async (args, ctx) => {
@@ -175,18 +188,21 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
         ctx.ui.notify("No guided plan is awaiting approval.", "warning");
         return;
       }
-      const plan = parsePlan(lastAssistantText(ctx));
-      if (plan.length === 0) {
+      if (!approveLatestPlan(ctx)) {
         ctx.ui.notify("Could not find a numbered plan in the last assistant response.", "error");
-        return;
       }
-      state.plan = plan;
-      state.currentStep = 0;
-      state.phase = "ready";
-      persist();
-      updateUi(ctx);
-      startCurrentStep(ctx);
     },
+  });
+
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension" || event.images?.length || state.phase !== "planning") {
+      return { action: "continue" };
+    }
+    const confirmation = event.text.trim().toLowerCase();
+    if (!["+", "да", "yes", "ок", "ok", "підтверджую", "подтверждаю"].includes(confirmation)) {
+      return { action: "continue" };
+    }
+    return approveLatestPlan(ctx) ? { action: "handled" } : { action: "continue" };
   });
 
   pi.registerCommand("next", {
@@ -292,7 +308,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
     const current = state.plan[state.currentStep];
     const instruction = state.phase === "executing"
       ? `You are in guided execution. Implement exactly one step: ${current?.text ?? "the approved step"}. Do not begin another plan step. End with changed files, checks, risks, and next-step proposal.`
-      : "You are in guided read-only mode. Analyze, clarify, plan, or discuss the completed step. Do not modify files until the user explicitly approves execution.";
+      : "You are in guided read-only mode. Analyze, clarify, plan, or discuss the completed step. Do not modify files until the user explicitly approves execution. After presenting a numbered plan, tell the user they may approve it with + or /approve-plan. Never claim that approval will apply the whole plan: approval starts exactly one step, followed by another user review gate.";
     return { systemPrompt: `${event.systemPrompt}\n\n[GUIDED WORKFLOW]\n${instruction}` };
   });
 
