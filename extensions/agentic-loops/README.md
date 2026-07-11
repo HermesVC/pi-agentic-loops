@@ -2,6 +2,30 @@
 
 An extensible Pi extension for workflows driven by specialized sub-agents.
 
+## Guided implementation
+
+Guided mode keeps implementation in the main Pi session while limiting a local model to one approved step at a time.
+
+```text
+/guided Add request caching to the API client
+```
+
+Pi first enters a read-only planning phase. Discuss requirements normally, then approve the last numbered plan:
+
+```text
+/approve-plan
+```
+
+The model executes only the first step and stops. Pi writes that step's diff to `.git/pi-guided/step-N.diff`; pre-existing working-tree changes are excluded from the step comparison. After reviewing it, use:
+
+- `/next` to accept the step and run the next one
+- `/adjust <instruction>` to correct the proposal or remaining plan without allowing edits
+- `/guided-status` to inspect progress
+- `/guided-cancel` to leave guided mode and keep existing changes
+- `/finish` after accepting every step to run an independent final audit
+
+Planning, adjustment, and review phases block built-in writes and non-read-only shell commands. State and plan progress survive Pi session resume. `/finish` uses the active model in a fresh low-thinking, read-only session and checks the original task, approved plan, repository, and current Git diff without receiving the implementing agent's narrative.
+
 ## Code review loop
 
 The code-review loop works on staged, unstaged, and untracked Git changes. It uses structured findings with stable IDs, severity, confidence, and verified evidence.
@@ -107,6 +131,7 @@ The read-only agents have `read`, `grep`, `find`, and `ls` so they can verify re
 
 ```text
 index.ts                 loop catalog and extension entry point
+guided/workflow.ts       approval-gated main-session implementation
 runtime/subagent.ts      isolated sub-agent runner with timeout
 runtime/types.ts         shared loop contracts
 loops/code-review.ts     structured review/fix/verify workflow
