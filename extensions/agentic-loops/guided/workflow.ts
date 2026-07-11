@@ -104,11 +104,39 @@ function latestAssistantPlan(ctx: ExtensionContext): GuidedStep[] {
   return findLatestPlan(assistantTexts);
 }
 
-function isReadOnlyBash(command: string): boolean {
-  if (/[>|;&]|\b(rm|del|move|mv|copy|cp|mkdir|rmdir|git\s+(add|commit|checkout|restore|reset|clean|merge|rebase|push)|npm\s+(install|update)|pnpm\s+(install|add)|yarn\s+add)\b/i.test(command)) {
+const READ_ONLY_GIT_COMMANDS = new Set([
+  "status", "diff", "log", "show", "rev-parse", "ls-files", "grep", "blame", "shortlog", "describe",
+  "reflog", "diff-tree", "diff-index", "diff-files", "name-rev", "merge-base", "cat-file", "for-each-ref",
+  "count-objects", "whatchanged",
+]);
+
+function isReadOnlyGit(args: string[]): boolean {
+  const subcommand = args[0]?.toLowerCase();
+  if (!subcommand) return false;
+  if (READ_ONLY_GIT_COMMANDS.has(subcommand)) return true;
+  const options = args.slice(1).map((arg) => arg.toLowerCase());
+  if (subcommand === "branch") {
+    if (options[0] && !options[0].startsWith("-")) return false;
+    return !options.some((arg) => ["-d", "-m", "-c", "--delete", "--move", "--copy", "--edit-description", "--set-upstream-to", "--unset-upstream", "--track", "--no-track", "--recurse-submodules"].includes(arg));
+  }
+  if (subcommand === "tag") {
+    if (options[0] && !options[0].startsWith("-")) return false;
+    return !options.some((arg) => ["-d", "--delete", "-a", "--annotate", "-s", "--sign", "-u", "--local-user", "-f", "--force", "-m", "--message", "--file"].includes(arg));
+  }
+  if (subcommand === "remote") return ["-v", "show", "get-url"].includes(options[0] ?? "");
+  if (subcommand === "stash") return ["list", "show"].includes(options[0] ?? "");
+  if (subcommand === "worktree") return options[0] === "list";
+  if (subcommand === "config") return options.some((arg) => ["--get", "--get-all", "--list", "-l", "--show-origin", "--show-scope", "get", "list"].includes(arg));
+  return false;
+}
+
+export function isReadOnlyBash(command: string): boolean {
+  if (/[\r\n>|;&]|\b(rm|del|move|mv|copy|cp|mkdir|rmdir|npm\s+(install|update)|pnpm\s+(install|add)|yarn\s+add)\b/i.test(command)) {
     return false;
   }
-  return /^\s*(rg|grep|find|ls|dir|Get-ChildItem|Get-Content|Select-String|git\s+(status|diff|log|show)|cat|type|pwd|Get-Location)\b/i.test(command);
+  const gitMatch = command.trim().match(/^git\s+(.+)$/i);
+  if (gitMatch?.[1]) return isReadOnlyGit(gitMatch[1].trim().split(/\s+/));
+  return /^\s*(rg|grep|find|ls|dir|Get-ChildItem|Get-Content|Select-String|cat|type|pwd|Get-Location)\b/i.test(command);
 }
 
 function phaseLabel(state: GuidedState): string {

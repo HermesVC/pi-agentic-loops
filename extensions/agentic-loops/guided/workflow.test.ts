@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { findLatestPlan, parsePlan } from "./workflow.ts";
+import { findLatestPlan, isReadOnlyBash, parsePlan } from "./workflow.ts";
 
 const fixtures = [
   ["1. Backend change\n2. Frontend change", ["Backend change", "Frontend change"]],
@@ -22,4 +22,20 @@ assert.deepEqual(transcriptPlan.map((step) => step.text), [
   "Перевірити інтеграцію",
 ]);
 
-console.log(`guided plan parser: ${fixtures.length + 1} fixtures passed`);
+for (const command of [
+  "git status --short", "git diff HEAD", "git log -10", "git blame src/app.ts", "git grep TODO",
+  "git rev-parse --show-toplevel", "git ls-files", "git branch -a", "git tag --list", "git stash show",
+  "git worktree list", "git config --get remote.origin.url",
+]) {
+  assert.equal(isReadOnlyBash(command), true, `expected read-only command: ${command}`);
+}
+
+for (const command of [
+  "git add .", "git commit -m test", "git checkout main", "git branch -D main", "git tag -d v1",
+  "git branch new-feature", "git tag v1.0.0",
+  "git stash pop", "git worktree remove ../copy", "git config user.name test", "git diff > patch.txt",
+]) {
+  assert.equal(isReadOnlyBash(command), false, `expected blocked command: ${command}`);
+}
+
+console.log(`guided workflow: ${fixtures.length + 1} plan fixtures and 23 shell policies passed`);
