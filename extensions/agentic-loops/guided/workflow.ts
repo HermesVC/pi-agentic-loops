@@ -1,6 +1,9 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
 
 type GuidedPhase = "idle" | "planning" | "ready" | "executing" | "review";
 
@@ -15,6 +18,8 @@ interface GuidedState {
   plan: GuidedStep[];
   currentStep: number;
   notes: string[];
+  stepBaseline?: string;
+  lastDiffFile?: string;
 }
 
 const ENTRY_TYPE = "agentic-guided-state";
@@ -22,6 +27,30 @@ const BLOCKED_TOOLS = new Set(["edit", "write", "apply_patch"]);
 
 function emptyState(): GuidedState {
   return { phase: "idle", task: "", plan: [], currentStep: 0, notes: [] };
+}
+
+function git(args: string[]): string {
+  return execFileSync("git", args, { cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+function captureBaseline(): string {
+  return git(["stash", "create"]) || git(["rev-parse", "HEAD"]);
+}
+
+function writeStepDiff(state: GuidedState): string | undefined {
+  if (!state.stepBaseline) return undefined;
+  const tracked = execFileSync("git", ["diff", "--binary", "--no-ext-diff", state.stepBaseline, "--"], {
+    cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 20 * 1024 * 1024,
+  });
+  const untracked = git(["ls-files", "--others", "--exclude-standard"]);
+  const untrackedNote = untracked ? `\n# New untracked files\n${untracked.split("\n").map((file) => `# ${file}`).join("\n")}\n` : "";
+  const gitDirValue = git(["rev-parse", "--git-dir"]);
+  const gitDir = isAbsolute(gitDirValue) ? gitDirValue : resolve(process.cwd(), gitDirValue);
+  const directory = join(gitDir, "pi-guided");
+  const file = join(directory, `step-${state.currentStep + 1}.diff`);
+  mkdirSync(directory, { recursive: true });
+  writeFileSync(file, `${tracked}${untrackedNote}`, "utf8");
+  return file;
 }
 
 function isAssistantMessage(message: AgentMessage): message is AssistantMessage {
@@ -97,6 +126,12 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
       return;
     }
     state.phase = "executing";
+    try {
+      state.stepBaseline = captureBaseline();
+    } catch {
+      state.stepBaseline = undefined;
+      ctx.ui.notify("Could not capture a Git baseline; the step will run without a diff artifact.", "warning");
+    }
     persist();
     updateUi(ctx);
     pi.sendUserMessage(
@@ -218,10 +253,17 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
 
   pi.on("agent_end", async (_event, ctx) => {
     if (state.phase === "executing") {
+      try {
+        state.lastDiffFile = writeStepDiff(state);
+      } catch (error) {
+        state.lastDiffFile = undefined;
+        ctx.ui.notify(`Could not write the step diff: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
       state.phase = "review";
       persist();
       updateUi(ctx);
-      ctx.ui.notify("Step complete. Review the diff, then use /next or /adjust.", "info");
+      const diffHint = state.lastDiffFile ? ` Diff: ${state.lastDiffFile}` : "";
+      ctx.ui.notify(`Step complete.${diffHint} Review it, then use /next or /adjust.`, "info");
     }
   });
 
