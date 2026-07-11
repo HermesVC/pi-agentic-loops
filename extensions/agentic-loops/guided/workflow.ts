@@ -148,6 +148,22 @@ function phaseLabel(state: GuidedState): string {
   return `review ${state.currentStep + 1}/${state.plan.length}`;
 }
 
+export function buildGuidedContext(state: GuidedState): string {
+  const current = state.plan[state.currentStep];
+  const progress = state.plan.length === 0
+    ? "not planned"
+    : state.currentStep >= state.plan.length ? `complete (${state.plan.length}/${state.plan.length})` : `${state.currentStep + 1}/${state.plan.length}`;
+  const plan = state.plan.length > 0
+    ? state.plan.map((step, index) => `${step.status === "done" ? "[x]" : index === state.currentStep ? "[>]" : "[ ]"} ${index + 1}. ${step.text}`).join("\n")
+    : "[not approved yet]";
+  const notes = state.notes.length > 0 ? state.notes.map((note) => `- ${note}`).join("\n") : "[none]";
+  const phaseInstruction = state.phase === "executing"
+    ? `Implement exactly one approved step: ${current?.text ?? "the current step"}. Do not begin another step. End with changed files, checks, risks, and the proposed next step.`
+    : "Stay read-only. Analyze, clarify, plan, or discuss the completed step. Do not modify files until explicit approval. After presenting a numbered plan, say it can be approved with + or /approve-plan. Approval starts exactly one step, never the whole plan.";
+
+  return `[GUIDED WORKFLOW STATE]\nPhase: ${state.phase}\nTask: ${state.task}\nProgress: ${progress}\n\nApproved plan:\n${plan}\n\nAccepted adjustments:\n${notes}\n\nObligation:\n${phaseInstruction}`;
+}
+
 export function registerGuidedWorkflow(pi: ExtensionAPI): void {
   let state = emptyState();
 
@@ -348,13 +364,15 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
     },
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async () => {
     if (state.phase === "idle") return;
-    const current = state.plan[state.currentStep];
-    const instruction = state.phase === "executing"
-      ? `You are in guided execution. Implement exactly one step: ${current?.text ?? "the approved step"}. Do not begin another plan step. End with changed files, checks, risks, and next-step proposal.`
-      : "You are in guided read-only mode. Analyze, clarify, plan, or discuss the completed step. Do not modify files until the user explicitly approves execution. After presenting a numbered plan, tell the user they may approve it with + or /approve-plan. Never claim that approval will apply the whole plan: approval starts exactly one step, followed by another user review gate.";
-    return { systemPrompt: `${event.systemPrompt}\n\n[GUIDED WORKFLOW]\n${instruction}` };
+    return {
+      message: {
+        customType: "agentic-guided-context",
+        content: buildGuidedContext(state),
+        display: false,
+      },
+    };
   });
 
   pi.on("tool_call", async (event) => {

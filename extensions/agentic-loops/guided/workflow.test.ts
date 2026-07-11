@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { findLatestPlan, isReadOnlyBash, parsePlan } from "./workflow.ts";
+import { buildGuidedContext, findLatestPlan, isReadOnlyBash, parsePlan } from "./workflow.ts";
 
 const fixtures = [
   ["1. Backend change\n2. Frontend change", ["Backend change", "Frontend change"]],
@@ -38,4 +38,29 @@ for (const command of [
   assert.equal(isReadOnlyBash(command), false, `expected blocked command: ${command}`);
 }
 
-console.log(`guided workflow: ${fixtures.length + 1} plan fixtures and 23 shell policies passed`);
+const executionContext = buildGuidedContext({
+  phase: "executing",
+  task: "Preserve product behavior",
+  currentStep: 1,
+  plan: [
+    { text: "Add data model", status: "done" },
+    { text: "Wire controller", status: "pending" },
+    { text: "Validate integration", status: "pending" },
+  ],
+  notes: ["Keep the legacy API compatible"],
+});
+for (const required of [
+  "Phase: executing", "Task: Preserve product behavior", "Progress: 2/3", "[x] 1. Add data model",
+  "[>] 2. Wire controller", "Keep the legacy API compatible", "Implement exactly one approved step",
+]) {
+  assert.ok(executionContext.includes(required), `missing guided context obligation: ${required}`);
+}
+
+const reviewContext = buildGuidedContext({
+  phase: "review", task: "Review gate", currentStep: 0,
+  plan: [{ text: "Make one change", status: "pending" }], notes: [],
+});
+assert.ok(reviewContext.includes("Stay read-only"));
+assert.ok(reviewContext.includes("Approval starts exactly one step"));
+
+console.log(`guided workflow: ${fixtures.length + 1} plan fixtures, 23 shell policies, and prompt obligations passed`);
