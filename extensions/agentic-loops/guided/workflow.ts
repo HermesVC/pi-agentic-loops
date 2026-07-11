@@ -69,14 +69,32 @@ function assistantText(message: AssistantMessage): string {
 }
 
 export function parsePlan(text: string): GuidedStep[] {
-  const steps: GuidedStep[] = [];
-  for (const line of text.split("\n")) {
-    const normalized = line.trim().replace(/^#{1,6}\s*/, "").replace(/^\*{1,2}|\*{1,2}$/g, "").trim();
-    const match = normalized.match(/^(?:\d+[.)]|[-*]\s*\[[ xX]?\])\s+(.+?)\s*$/)
-      ?? normalized.match(/^(?:step|крок|шаг)\s*\d+\s*(?:[.):]|[-–—])\s*(.+?)\s*$/i);
-    if (match?.[1]) steps.push({ text: match[1].replace(/\*{1,2}$/g, "").trim(), status: "pending" });
-  }
-  return steps;
+  const lines = text.split("\n");
+  const normalize = (line: string) => line.trim()
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/^\*{1,2}|\*{1,2}$/g, "")
+    .trim();
+  const toStep = (value: string): GuidedStep => ({
+    text: value.replace(/\*{1,2}$/g, "").trim(),
+    status: "pending",
+  });
+
+  // Explicitly labelled steps are unambiguous and may contain nested numbered
+  // implementation details. Prefer them over generic Markdown list items.
+  const labelled = lines.flatMap((line) => {
+    const match = normalize(line).match(/^(?:step|крок|шаг)\s*\d+\s*(?:[.):]|[-–—])\s*(.+?)\s*$/i);
+    return match?.[1] ? [toStep(match[1])] : [];
+  });
+  if (labelled.length > 0) return labelled;
+
+  const numbered = lines.flatMap((line) => {
+    const indent = line.match(/^[\t ]*/)?.[0].replace(/\t/g, "    ").length ?? 0;
+    const match = normalize(line).match(/^(?:\d+[.)]|[-*]\s*\[[ xX]?\])\s+(.+?)\s*$/);
+    return match?.[1] ? [{ indent, step: toStep(match[1]) }] : [];
+  });
+  if (numbered.length === 0) return [];
+  const topLevelIndent = Math.min(...numbered.map((item) => item.indent));
+  return numbered.filter((item) => item.indent === topLevelIndent).map((item) => item.step);
 }
 
 export function findLatestPlan(textsNewestFirst: string[]): GuidedStep[] {

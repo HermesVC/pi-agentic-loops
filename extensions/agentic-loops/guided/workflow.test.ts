@@ -6,6 +6,11 @@ const fixtures = [
   ["### Step 1: Create model\n### Step 2: Add controller", ["Create model", "Add controller"]],
   ["**Крок 1 — Створити модель**\n**Крок 2 — Додати контролер**", ["Створити модель", "Додати контролер"]],
   ["Шаг 1. Изменить API\nШаг 2. Проверить UI", ["Изменить API", "Проверить UI"]],
+  [
+    "### Крок 1: Backend\n\nЗміни:\n1. Оновити запит\n2. Передати кольори\n\n### Крок 2: Frontend\n\nЗміни:\n1. Створити клас\n2. Додати контролер",
+    ["Backend", "Frontend"],
+  ],
+  ["1. Backend\n   1. Оновити запит\n   2. Передати кольори\n2. Frontend\n   1. Створити клас", ["Backend", "Frontend"]],
 ] as const;
 
 for (const [source, expected] of fixtures) {
