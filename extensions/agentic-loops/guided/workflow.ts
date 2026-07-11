@@ -4,8 +4,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { runSubagent } from "../runtime/subagent.ts";
 
-type GuidedPhase = "idle" | "planning" | "ready" | "executing" | "review";
+type GuidedPhase = "idle" | "planning" | "ready" | "executing" | "review" | "auditing";
 
 interface GuidedStep {
   text: string;
@@ -97,6 +98,7 @@ function phaseLabel(state: GuidedState): string {
   if (state.phase === "planning") return "planning";
   if (state.phase === "ready") return "plan ready";
   if (state.phase === "executing") return `step ${state.currentStep + 1}/${state.plan.length}`;
+  if (state.phase === "auditing") return "final audit";
   return `review ${state.currentStep + 1}/${state.plan.length}`;
 }
 
@@ -216,6 +218,50 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       const plan = state.plan.map((step, index) => `${step.status === "done" ? "[x]" : "[ ]"} ${index + 1}. ${step.text}`).join("\n");
       ctx.ui.notify(`Guided: ${phaseLabel(state)}\nTask: ${state.task || "-"}${plan ? `\n${plan}` : ""}`, "info");
+    },
+  });
+
+  pi.registerCommand("finish", {
+    description: "Run an independent audit after all guided steps are approved",
+    handler: async (_args, ctx) => {
+      if (state.phase !== "ready" || state.plan.length === 0 || state.currentStep < state.plan.length) {
+        ctx.ui.notify("Approve every guided step before running /finish.", "warning");
+        return;
+      }
+      const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+      const diff = execFileSync("git", ["diff", "--no-ext-diff", "HEAD", "--"], {
+        cwd: process.cwd(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 20 * 1024 * 1024,
+      });
+      state.phase = "auditing";
+      persist();
+      updateUi(ctx);
+      ctx.ui.notify("Independent final audit started.", "info");
+      try {
+        const result = await runSubagent({
+          cwd: process.cwd(),
+          model,
+          thinkingLevel: "low",
+          tools: ["read"],
+          timeoutMs: 180_000,
+          heartbeatMs: 5_000,
+          systemPrompt: "You are an independent implementation auditor. Be concise. Check behavior against the task and approved plan, using the diff and repository only. Do not trust the implementing agent's summary. Report only concrete gaps, regressions, missing validation, and acceptance failures. If none are found, say PASS and name residual risks.",
+          prompt: `TASK\n${state.task}\n\nAPPROVED PLAN\n${state.plan.map((step, index) => `${index + 1}. ${step.text}`).join("\n")}\n\nCURRENT DIFF\n${diff.slice(0, 50_000) || "[no tracked diff]"}`,
+          onProgress: (progress) => {
+            const seconds = Math.round(progress.elapsedMs / 1000);
+            ctx.ui.setStatus("agentic-guided", `guided: audit ${progress.activity} ${seconds}s`);
+          },
+        });
+        pi.sendMessage({ customType: "guided-final-audit", content: `Independent guided audit:\n\n${result}`, display: true }, { triggerTurn: false });
+        state = emptyState();
+        persist();
+        updateUi(ctx);
+        ctx.ui.notify("Guided workflow finished. Independent audit is shown above.", "info");
+      } catch (error) {
+        state.phase = "ready";
+        persist();
+        updateUi(ctx);
+        ctx.ui.notify(`Final audit failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
     },
   });
 
