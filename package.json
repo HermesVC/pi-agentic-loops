@@ -1,20 +1,30 @@
 {
-  "name": "pi-setup",
+  "name": "pi-agentic-loops",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Guided implementation and Git-diff code review workflows for Pi",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node example.js"
+    "test": "node extensions/agentic-loops/guided/workflow.test.ts"
   },
-  "keywords": [],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "agentic-workflow",
+    "code-review"
+  ],
   "author": "",
   "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HermesVC/pi-agentic-loops.git"
+  },
   "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions/agentic-loops/index.ts"
+    ]
+  },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.80.6",
-    "dotenv": "^16.5.0",
-    "express": "^5.1.0",
     "typebox": "^1.3.6"
   }
 }
