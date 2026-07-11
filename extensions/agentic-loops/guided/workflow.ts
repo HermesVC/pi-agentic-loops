@@ -19,6 +19,7 @@ interface GuidedState {
   plan: GuidedStep[];
   currentStep: number;
   notes: string[];
+  toolsBeforeGuided?: string[];
   stepBaseline?: string;
   lastDiffFile?: string;
 }
@@ -105,6 +106,14 @@ function phaseLabel(state: GuidedState): string {
 export function registerGuidedWorkflow(pi: ExtensionAPI): void {
   let state = emptyState();
 
+  const enableGuidedSearchTools = () => {
+    if (state.toolsBeforeGuided === undefined) state.toolsBeforeGuided = pi.getActiveTools();
+    pi.setActiveTools([...new Set([...pi.getActiveTools(), "read", "grep", "find", "ls"])]);
+  };
+  const restoreTools = () => {
+    if (state.toolsBeforeGuided !== undefined) pi.setActiveTools(state.toolsBeforeGuided);
+  };
+
   const persist = () => pi.appendEntry(ENTRY_TYPE, state);
   const updateUi = (ctx: ExtensionContext) => {
     ctx.ui.setStatus("agentic-guided", state.phase === "idle" ? undefined : `guided: ${phaseLabel(state)}`);
@@ -150,6 +159,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
         return;
       }
       state = { phase: "planning", task, plan: [], currentStep: 0, notes: [] };
+      enableGuidedSearchTools();
       persist();
       updateUi(ctx);
       pi.sendUserMessage(
@@ -252,6 +262,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
           },
         });
         pi.sendMessage({ customType: "guided-final-audit", content: `Independent guided audit:\n\n${result}`, display: true }, { triggerTurn: false });
+        restoreTools();
         state = emptyState();
         persist();
         updateUi(ctx);
@@ -268,6 +279,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
   pi.registerCommand("guided-cancel", {
     description: "Exit guided mode without reverting files",
     handler: async (_args, ctx) => {
+      restoreTools();
       state = emptyState();
       persist();
       updateUi(ctx);
@@ -318,6 +330,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
       .filter((candidate: { type: string; customType?: string }) => candidate.type === "custom" && candidate.customType === ENTRY_TYPE)
       .pop() as { data?: GuidedState } | undefined;
     if (entry?.data) state = entry.data;
+    if (state.phase !== "idle") enableGuidedSearchTools();
     updateUi(ctx);
   });
 }
