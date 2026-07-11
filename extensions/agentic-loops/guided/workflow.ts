@@ -67,24 +67,41 @@ function assistantText(message: AssistantMessage): string {
     .trim();
 }
 
-function lastAssistantText(ctx: ExtensionContext): string {
-  const entries = ctx.sessionManager.getEntries();
-  for (let index = entries.length - 1; index >= 0; index--) {
-    const entry = entries[index];
-    if (entry.type !== "message" || !("message" in entry)) continue;
-    const message = entry.message as AgentMessage;
-    if (isAssistantMessage(message)) return assistantText(message);
-  }
-  return "";
-}
-
-function parsePlan(text: string): GuidedStep[] {
+export function parsePlan(text: string): GuidedStep[] {
   const steps: GuidedStep[] = [];
   for (const line of text.split("\n")) {
-    const match = line.match(/^\s*(?:\d+[.)]|[-*]\s*\[[ xX]?\])\s+(.+?)\s*$/);
-    if (match?.[1]) steps.push({ text: match[1], status: "pending" });
+    const normalized = line.trim().replace(/^#{1,6}\s*/, "").replace(/^\*{1,2}|\*{1,2}$/g, "").trim();
+    const match = normalized.match(/^(?:\d+[.)]|[-*]\s*\[[ xX]?\])\s+(.+?)\s*$/)
+      ?? normalized.match(/^(?:step|крок|шаг)\s*\d+\s*(?:[.):]|[-–—])\s*(.+?)\s*$/i);
+    if (match?.[1]) steps.push({ text: match[1].replace(/\*{1,2}$/g, "").trim(), status: "pending" });
   }
   return steps;
+}
+
+export function findLatestPlan(textsNewestFirst: string[]): GuidedStep[] {
+  for (const text of textsNewestFirst) {
+    const plan = parsePlan(text);
+    if (plan.length > 0) return plan;
+  }
+  return [];
+}
+
+function latestAssistantPlan(ctx: ExtensionContext): GuidedStep[] {
+  const entries = ctx.sessionManager.getEntries();
+  const assistantTexts: string[] = [];
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
+      const saved = (entry as { data?: GuidedState }).data;
+      if (saved?.phase === "idle") break;
+      continue;
+    }
+    if (entry.type !== "message" || !("message" in entry)) continue;
+    const message = entry.message as AgentMessage;
+    if (!isAssistantMessage(message)) continue;
+    assistantTexts.push(assistantText(message));
+  }
+  return findLatestPlan(assistantTexts);
 }
 
 function isReadOnlyBash(command: string): boolean {
@@ -152,7 +169,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
 
   const approveLatestPlan = (ctx: ExtensionContext): boolean => {
     if (state.phase !== "planning" && state.phase !== "ready") return false;
-    const plan = parsePlan(lastAssistantText(ctx));
+    const plan = latestAssistantPlan(ctx);
     if (plan.length === 0) return false;
     state.plan = plan;
     state.currentStep = 0;
