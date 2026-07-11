@@ -29,6 +29,8 @@ Local defaults:
 - model-call budget: 2 for review-only, 4 with one fix round (+ recovery within budget)
 - timeout: 5 minutes per sub-agent
 - no blind verifier, evidence pass, or final regression review
+- review chunks around 12k characters, grouped first by file and then by hunk
+- finding-scoped diff context for the fixer and compact post-fix check
 
 `--mode light` remains as a compatibility alias for `--profile local`.
 

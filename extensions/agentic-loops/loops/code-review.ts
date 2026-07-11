@@ -9,6 +9,7 @@ import { runSubagent } from "../runtime/subagent.ts";
 
 const DEFAULT_MAX_DIFF_CHARS = 120_000;
 const LIGHT_MAX_DIFF_CHARS = 40_000;
+const LOCAL_REVIEW_CHUNK_CHARS = 12_000;
 const REVIEW_TOOLS = ["read", "grep", "find", "ls"];
 const LIGHT_REVIEW_TOOLS = ["read", "grep"];
 const LIGHT_FIXER_TOOLS = ["read", "grep", "edit", "write"];
@@ -99,6 +100,7 @@ interface LoopResult {
   status: LoopStatus;
   mode: ReviewMode;
   modelCalls: number;
+  reviewChunks: number;
   fixRounds: number;
   findings: Finding[];
   unresolved: Finding[];
@@ -315,6 +317,59 @@ export function jsonFromResponse(text: string): any {
   }
 }
 
+function splitLargeDiffSection(section: string, targetChars: number): string[] {
+  if (section.length <= targetChars) return [section];
+  const hunkStarts = [...section.matchAll(/^@@/gm)].map((match) => match.index ?? 0);
+  if (!hunkStarts.length) return [section];
+  const header = section.slice(0, hunkStarts[0]);
+  const hunks = hunkStarts.map((start, index) => section.slice(start, hunkStarts[index + 1] ?? section.length));
+  const chunks: string[] = [];
+  let current = header;
+  for (const hunk of hunks) {
+    if (current.length > header.length && current.length + hunk.length > targetChars) {
+      chunks.push(current.trimEnd());
+      current = header;
+    }
+    current += hunk;
+  }
+  if (current.length > header.length) chunks.push(current.trimEnd());
+  return chunks;
+}
+
+export function splitGitDiffForReview(diff: string, targetChars = LOCAL_REVIEW_CHUNK_CHARS): string[] {
+  const fileSections = diff.split(/(?=^diff --git )/m).filter((section) => section.trim());
+  const sections = fileSections.flatMap((section) => splitLargeDiffSection(section, targetChars));
+  const chunks: string[] = [];
+  let current = "";
+  for (const section of sections) {
+    if (current && current.length + section.length + 1 > targetChars) {
+      chunks.push(current.trimEnd());
+      current = "";
+    }
+    if (!current && section.length > targetChars) {
+      chunks.push(section.trimEnd());
+      continue;
+    }
+    current += `${current ? "\n" : ""}${section}`;
+  }
+  if (current.trim()) chunks.push(current.trimEnd());
+  return chunks.length ? chunks : [diff];
+}
+
+export function selectDiffFiles(diff: string, files: string[]): string {
+  const wanted = new Set(files.map((file) => file.replaceAll("\\", "/").replace(/^\.?\//, "").toLowerCase()));
+  if (!wanted.size) return diff;
+  const sections = diff.split(/(?=^diff --git )/m).filter((section) => section.trim());
+  const selected = sections.filter((section) => {
+    const match = section.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+    if (!match) return false;
+    const before = match[1].replace(/^"|"$/g, "").toLowerCase();
+    const after = match[2].replace(/^"|"$/g, "").toLowerCase();
+    return wanted.has(before) || wanted.has(after);
+  });
+  return selected.length ? selected.join("\n").trim() : diff;
+}
+
 function normalizeFindings(value: unknown): Finding[] {
   if (!Array.isArray(value)) return [];
   const severities = new Set(["critical", "high", "medium", "low"]);
@@ -333,6 +388,22 @@ function normalizeFindings(value: unknown): Finding[] {
       fix: String(raw.fix),
     }];
   });
+}
+
+function mergeChunkFindings(findings: Finding[]): Finding[] {
+  const severityRank: Record<FindingSeverity, number> = { low: 1, medium: 2, high: 3, critical: 4 };
+  const merged = new Map<string, Finding>();
+  for (const finding of findings) {
+    const key = `${finding.file.toLowerCase()}:${finding.line ?? ""}:${finding.title.toLowerCase().trim()}`;
+    const previous = merged.get(key);
+    if (!previous || severityRank[finding.severity] > severityRank[previous.severity] || finding.confidence > previous.confidence) {
+      merged.set(key, finding);
+    }
+  }
+  return [...merged.values()].map((finding, index) => ({
+    ...finding,
+    id: `F-${String(index + 1).padStart(3, "0")}`,
+  }));
 }
 
 function selectFindings(findings: Finding[], policy: FixSeverityPolicy): Finding[] {
@@ -497,7 +568,10 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   const stages: Array<{ label: string; durationMs: number }> = [];
   const { mode, profile, effective } = applyProfileDefaults(input);
   const maxFixRounds = effective.maxIterations ?? 1;
-  const maxCalls = effective.maxModelCalls ?? profile.maxModelCalls(maxFixRounds, effective.applyFixes ?? profile.defaultApplyFixes);
+  const initialDiff = collectGitDiff(cwd, effective);
+  const reviewChunks = mode === "light" ? splitGitDiffForReview(initialDiff) : [initialDiff];
+  const maxCalls = input.maxModelCalls
+    ?? profile.maxModelCalls(maxFixRounds, effective.applyFixes ?? profile.defaultApplyFixes) + reviewChunks.length - 1;
   const timeoutMs = (effective.timeoutMinutes ?? profile.timeoutMinutes) * 60_000;
   const maxLines = effective.maxChangedLines ?? (mode === "light" ? 500 : 2_000);
   const validationCommands = effective.validationCommands?.map((command) => command.trim()).filter(Boolean) ?? [];
@@ -512,13 +586,14 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   let structuredRecoveryUsed = false;
   const validation: ValidationRun[] = [];
   const verificationRuns: VerificationRun[] = [];
-  const finish = (result: Omit<LoopResult, "durationMs" | "stages">): LoopResult => ({
+  const finish = (result: Omit<LoopResult, "durationMs" | "stages" | "validation" | "verification" | "rollbacks" | "reviewChunks">): LoopResult => ({
     ...result,
     durationMs: Date.now() - loopStartedAt,
     stages,
     validation,
     verification: verificationRuns,
     rollbacks,
+    reviewChunks: reviewChunks.length,
   });
   const call = async (
     label: string,
@@ -568,15 +643,18 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     }
   };
 
-  const initialDiff = collectGitDiff(cwd, effective);
-  let findings = normalizeFindings((
-    await structuredCall(
-      "Reviewing",
-      reviewPrompt(effective, initialDiff, "initial review", profile.compactPrompts),
+  const chunkFindings: Finding[] = [];
+  for (let index = 0; index < reviewChunks.length; index++) {
+    const label = reviewChunks.length > 1 ? `Reviewing chunk ${index + 1}/${reviewChunks.length}` : "Reviewing";
+    const response = await structuredCall(
+      label,
+      reviewPrompt(effective, reviewChunks[index], `initial review chunk ${index + 1}/${reviewChunks.length}`, profile.compactPrompts),
       reviewerSystem,
       profile.reviewTools,
-    )
-  ).findings);
+    );
+    chunkFindings.push(...normalizeFindings(response.findings));
+  }
+  let findings = mergeChunkFindings(chunkFindings);
   if (!findings.length) return finish({ status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] });
 
   if (profile.evidenceCheck) {
@@ -603,7 +681,8 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   let previousFingerprint = createHash("sha256").update(collectGitDiff(cwd, effective, false)).digest("hex");
   for (let round = 1; round <= maxFixRounds && unresolved.length; round++) {
     fixRounds = round;
-    const before = collectGitDiff(cwd, effective);
+    const fullBefore = collectGitDiff(cwd, effective);
+    const before = mode === "light" ? selectDiffFiles(fullBefore, unresolved.map((finding) => finding.file)) : fullBefore;
     const snapshot = captureRoundSnapshot(cwd, changedFiles(cwd, {}));
     const rollback = () => {
       restoreRoundSnapshot(snapshot, changedFiles(cwd, {}));
@@ -653,9 +732,10 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     }
 
     if (profile.lightVerification) {
+      const verificationDiff = selectDiffFiles(collectGitDiff(cwd, effective), unresolved.map((finding) => finding.file));
       const verificationResponse = await structuredCall(
         "Post-fix check",
-        lightVerifyPrompt(effective, collectGitDiff(cwd, effective), unresolved),
+        lightVerifyPrompt(effective, verificationDiff, unresolved),
         LIGHT_VERIFIER_SYSTEM,
         profile.reviewTools,
       );
@@ -712,6 +792,7 @@ function formatResult(result: LoopResult): string {
     `Status: ${result.status.toUpperCase()}`,
     `Mode: ${result.mode}`,
     `Model calls: ${result.modelCalls}`,
+    `Review chunks: ${result.reviewChunks}`,
     `Fix rounds: ${result.fixRounds}`,
     `Rolled back rounds: ${result.rollbacks}`,
     `Total duration: ${formatDuration(result.durationMs)}`,
