@@ -8,12 +8,12 @@ import { runSubagent } from "../runtime/subagent.ts";
 
 type GuidedPhase = "idle" | "planning" | "ready" | "executing" | "review" | "auditing";
 
-interface GuidedStep {
+export interface GuidedStep {
   text: string;
   status: "pending" | "done";
 }
 
-interface GuidedState {
+export interface GuidedState {
   phase: GuidedPhase;
   task: string;
   plan: GuidedStep[];
@@ -30,6 +30,28 @@ const PLANNING_RULES = `Resolve blocking questions before proposing the plan; qu
 
 function emptyState(): GuidedState {
   return { phase: "idle", task: "", plan: [], currentStep: 0, notes: [] };
+}
+
+function reconcileCompletedPlan(state: GuidedState): boolean {
+  if (state.plan.length === 0) return false;
+  const complete = state.currentStep >= state.plan.length || state.plan.every((step) => step.status === "done");
+  if (!complete) return false;
+  state.plan.forEach((step) => { step.status = "done"; });
+  state.currentStep = state.plan.length;
+  if (state.phase !== "idle" && state.phase !== "auditing") state.phase = "ready";
+  return true;
+}
+
+export function acceptReviewedStep(state: GuidedState): "not-waiting" | "next" | "complete" {
+  if (reconcileCompletedPlan(state)) return "complete";
+  if ((state.phase !== "review" && state.phase !== "executing") || !state.plan[state.currentStep]) return "not-waiting";
+  state.plan[state.currentStep]!.status = "done";
+  state.currentStep += 1;
+  return reconcileCompletedPlan(state) ? "complete" : "next";
+}
+
+export function isGuidedReadyToFinish(state: GuidedState): boolean {
+  return reconcileCompletedPlan(state) && state.phase === "ready";
 }
 
 function git(args: string[]): string {
@@ -290,14 +312,12 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
   pi.registerCommand("next", {
     description: "Accept the current guided step and execute the next one",
     handler: async (_args, ctx) => {
-      if (state.phase !== "review") {
-        ctx.ui.notify("The guided workflow is not waiting for step approval.", "warning");
+      const transition = acceptReviewedStep(state);
+      if (transition === "not-waiting") {
+        ctx.ui.notify(`The guided workflow is not waiting for step approval (current phase: ${phaseLabel(state)}).`, "warning");
         return;
       }
-      state.plan[state.currentStep]!.status = "done";
-      state.currentStep += 1;
-      if (state.currentStep >= state.plan.length) {
-        state.phase = "ready";
+      if (transition === "complete") {
         persist();
         updateUi(ctx);
         ctx.ui.notify("All planned steps are complete. Use /finish for the final audit.", "info");
@@ -308,16 +328,42 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("adjust", {
-    description: "Add guidance before continuing: /adjust <instruction>",
+    description: "Revise the plan or run corrections without accepting the current step",
     handler: async (args, ctx) => {
       const note = args.trim();
       if (state.phase === "idle" || !note) {
         ctx.ui.notify("Usage during a guided task: /adjust <instruction>", "warning");
         return;
       }
+      if (state.phase === "auditing") {
+        ctx.ui.notify(`Adjustments cannot start during ${phaseLabel(state)}.`, "warning");
+        return;
+      }
       state.notes.push(note);
+      if (state.phase === "review" || state.phase === "executing") {
+        state.phase = "executing";
+        persist();
+        updateUi(ctx);
+        pi.sendUserMessage(`Correct the current guided step without advancing the plan: ${note}\n\nApply only the requested correction, validate it, and stop for review again.`);
+        return;
+      }
+      if (isGuidedReadyToFinish(state)) {
+        state.plan.push({ text: `Correction: ${note}`, status: "pending" });
+        state.currentStep = state.plan.length - 1;
+        state.phase = "executing";
+        try {
+          state.stepBaseline = captureBaseline();
+        } catch {
+          state.stepBaseline = undefined;
+          ctx.ui.notify("Could not capture a Git baseline; the correction will run without a diff artifact.", "warning");
+        }
+        persist();
+        updateUi(ctx);
+        pi.sendUserMessage(`Apply this guided correction before the final audit: ${note}\n\nImplement only this correction, validate it, and stop for review.`);
+        return;
+      }
       persist();
-      pi.sendUserMessage(`Guided workflow adjustment: ${note}\nRevise the remaining plan or current proposal. Do not edit files until /next.`);
+      pi.sendUserMessage(`Guided workflow adjustment: ${note}\nRevise the plan or current proposal in read-only mode. Do not edit files.`);
     },
   });
 
@@ -332,7 +378,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
   pi.registerCommand("finish", {
     description: "Run an independent audit after all guided steps are approved",
     handler: async (_args, ctx) => {
-      if (state.phase !== "ready" || state.plan.length === 0 || state.currentStep < state.plan.length) {
+      if (!isGuidedReadyToFinish(state)) {
         ctx.ui.notify("Approve every guided step before running /finish.", "warning");
         return;
       }
@@ -374,15 +420,22 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
     },
   });
 
-  pi.registerCommand("guided-cancel", {
+  const exitGuided = async (ctx: ExtensionContext) => {
+    restoreTools();
+    state = emptyState();
+    persist();
+    updateUi(ctx);
+    ctx.ui.notify("Guided mode disabled. Existing changes were kept.", "info");
+  };
+
+  pi.registerCommand("guided-exit", {
     description: "Exit guided mode without reverting files",
-    handler: async (_args, ctx) => {
-      restoreTools();
-      state = emptyState();
-      persist();
-      updateUi(ctx);
-      ctx.ui.notify("Guided mode disabled. Existing changes were kept.", "info");
-    },
+    handler: async (_args, ctx) => exitGuided(ctx),
+  });
+
+  pi.registerCommand("guided-cancel", {
+    description: "Alias for /guided-exit",
+    handler: async (_args, ctx) => exitGuided(ctx),
   });
 
   pi.on("before_agent_start", async () => {
@@ -430,6 +483,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
       .filter((candidate: { type: string; customType?: string }) => candidate.type === "custom" && candidate.customType === ENTRY_TYPE)
       .pop() as { data?: GuidedState } | undefined;
     if (entry?.data) state = entry.data;
+    if (state.phase !== "idle") reconcileCompletedPlan(state);
     if (state.phase !== "idle") enableGuidedSearchTools();
     updateUi(ctx);
   });

@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { buildGuidedContext, findLatestPlan, isReadOnlyBash, parsePlan } from "./workflow.ts";
+import {
+  acceptReviewedStep, buildGuidedContext, findLatestPlan, isGuidedReadyToFinish, isReadOnlyBash, parsePlan,
+  type GuidedState,
+} from "./workflow.ts";
 
 const fixtures = [
   ["1. Backend change\n2. Frontend change", ["Backend change", "Frontend change"]],
@@ -80,4 +83,28 @@ for (const required of [
   assert.ok(planningContext.includes(required), `missing planning granularity rule: ${required}`);
 }
 
-console.log(`guided workflow: ${fixtures.length + 1} plan fixtures, 23 shell policies, and prompt obligations passed`);
+const finalStepState: GuidedState = {
+  phase: "review", task: "Finish reliably", currentStep: 1, notes: [],
+  plan: [{ text: "First", status: "done" }, { text: "Last", status: "pending" }],
+};
+assert.equal(acceptReviewedStep(finalStepState), "complete");
+assert.equal(finalStepState.phase, "ready");
+assert.equal(finalStepState.currentStep, 2);
+assert.equal(isGuidedReadyToFinish(finalStepState), true);
+
+const staleCompletedState: GuidedState = {
+  phase: "review", task: "Recover stale state", currentStep: 2, notes: [],
+  plan: [{ text: "First", status: "done" }, { text: "Last", status: "pending" }],
+};
+assert.equal(acceptReviewedStep(staleCompletedState), "complete");
+assert.equal(staleCompletedState.phase, "ready");
+assert.ok(staleCompletedState.plan.every((step) => step.status === "done"));
+
+const missedAgentEndState: GuidedState = {
+  phase: "executing", task: "Recover missed agent_end", currentStep: 0, notes: [],
+  plan: [{ text: "Only step", status: "pending" }],
+};
+assert.equal(acceptReviewedStep(missedAgentEndState), "complete");
+assert.equal(isGuidedReadyToFinish(missedAgentEndState), true);
+
+console.log(`guided workflow: ${fixtures.length + 1} plan fixtures, 23 shell policies, transitions, and prompt obligations passed`);

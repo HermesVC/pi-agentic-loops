@@ -19,12 +19,13 @@ Pi first enters a read-only planning phase. Discuss requirements normally, then 
 The model executes only the first step and stops. Pi writes that step's diff to `.git/pi-guided/step-N.diff`; pre-existing working-tree changes are excluded from the step comparison. After reviewing it, use:
 
 - `/next` to accept the step and run the next one
-- `/adjust <instruction>` to correct the proposal or remaining plan without allowing edits
+- `/adjust <instruction>` during review to run a correction pass without accepting or advancing the current step
+- `/adjust <instruction>` after the last accepted step to add one reviewed correction pass before the audit
 - `/guided-status` to inspect progress
-- `/guided-cancel` to leave guided mode and keep existing changes
+- `/guided-exit` to leave guided mode and keep existing changes (`/guided-cancel` remains an alias)
 - `/finish` after accepting every step to run an independent final audit
 
-Planning, adjustment, and review phases block built-in writes and non-read-only shell commands. State and plan progress survive Pi session resume. `/finish` uses the active model in a fresh low-thinking, read-only session and checks the original task, approved plan, repository, and current Git diff without receiving the implementing agent's narrative.
+Planning and review phases block built-in writes and non-read-only shell commands. An `/adjust` correction temporarily enables implementation for one turn, then returns to review without advancing the plan. State and plan progress survive Pi session resume. `/finish` uses the active model in a fresh low-thinking, read-only session and checks the original task, approved plan, repository, and current Git diff without receiving the implementing agent's narrative.
 
 ## Code review loop
 
