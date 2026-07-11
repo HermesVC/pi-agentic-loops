@@ -63,4 +63,16 @@ const reviewContext = buildGuidedContext({
 assert.ok(reviewContext.includes("Stay read-only"));
 assert.ok(reviewContext.includes("Approval starts exactly one step"));
 
+const planningContext = buildGuidedContext({
+  phase: "planning", task: "Implement painting", currentStep: 0, plan: [], notes: [],
+});
+for (const required of [
+  "2-5 meaningful vertical implementation steps",
+  "questions and research tasks are not plan steps",
+  "Do not create separate steps merely for one file, field, method, checkbox, translation key, or investigation",
+  "useful and verifiable on its own",
+]) {
+  assert.ok(planningContext.includes(required), `missing planning granularity rule: ${required}`);
+}
+
 console.log(`guided workflow: ${fixtures.length + 1} plan fixtures, 23 shell policies, and prompt obligations passed`);

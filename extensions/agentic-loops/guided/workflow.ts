@@ -26,6 +26,7 @@ interface GuidedState {
 
 const ENTRY_TYPE = "agentic-guided-state";
 const BLOCKED_TOOLS = new Set(["edit", "write", "apply_patch"]);
+const PLANNING_RULES = `Resolve blocking questions before proposing the plan; questions and research tasks are not plan steps. Produce 2-5 meaningful vertical implementation steps. Each step should deliver a coherent, independently reviewable behavior or integration boundary, usually grouping the model, persistence, UI, and validation changes that must work together. Do not create separate steps merely for one file, field, method, checkbox, translation key, or investigation. Split only when the result is useful and verifiable on its own, and keep a step small enough for one focused implementation turn.`;
 
 function emptyState(): GuidedState {
   return { phase: "idle", task: "", plan: [], currentStep: 0, notes: [] };
@@ -159,7 +160,9 @@ export function buildGuidedContext(state: GuidedState): string {
   const notes = state.notes.length > 0 ? state.notes.map((note) => `- ${note}`).join("\n") : "[none]";
   const phaseInstruction = state.phase === "executing"
     ? `Implement exactly one approved step: ${current?.text ?? "the current step"}. Do not begin another step. End with changed files, checks, risks, and the proposed next step.`
-    : "Stay read-only. Analyze, clarify, plan, or discuss the completed step. Do not modify files until explicit approval. After presenting a numbered plan, say it can be approved with + or /approve-plan. Approval starts exactly one step, never the whole plan.";
+    : state.phase === "planning"
+      ? `Stay read-only. ${PLANNING_RULES} After presenting the numbered plan, say it can be approved with + or /approve-plan. Approval starts exactly one step, never the whole plan.`
+      : "Stay read-only. Discuss the completed step or requested adjustment without modifying files until explicit approval. Approval starts exactly one step, never the whole plan.";
 
   return `[GUIDED WORKFLOW STATE]\nPhase: ${state.phase}\nTask: ${state.task}\nProgress: ${progress}\n\nApproved plan:\n${plan}\n\nAccepted adjustments:\n${notes}\n\nObligation:\n${phaseInstruction}`;
 }
@@ -237,7 +240,7 @@ export function registerGuidedWorkflow(pi: ExtensionAPI): void {
       persist();
       updateUi(ctx);
       pi.sendUserMessage(
-        `GUIDED TASK: ${task}\n\nAnalyze the repository and requirements in read-only mode. Ask only blocking clarification questions. When enough is known, provide a short numbered plan of independently verifiable implementation steps. Do not modify files.`,
+        `GUIDED TASK: ${task}\n\nAnalyze the repository and requirements in read-only mode. ${PLANNING_RULES} Do not modify files.`,
       );
     },
   });
