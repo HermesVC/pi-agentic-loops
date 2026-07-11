@@ -8,11 +8,32 @@ import { promisify } from "node:util";
 import { runSubagent } from "../runtime/subagent.ts";
 
 const DEFAULT_MAX_DIFF_CHARS = 120_000;
+const LIGHT_MAX_DIFF_CHARS = 40_000;
 const REVIEW_TOOLS = ["read", "grep", "find", "ls"];
+const LIGHT_REVIEW_TOOLS = ["read", "grep"];
+const LIGHT_FIXER_TOOLS = ["read", "grep", "edit", "write"];
 
 type FindingSeverity = "critical" | "high" | "medium" | "low";
 type FixSeverityPolicy = "all" | "medium_and_above" | "critical_only";
-type ReviewMode = "fast" | "strict";
+type ReviewMode = "fast" | "strict" | "light";
+type ExecutionProfile = "standard" | "local";
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+interface ReviewProfile {
+  maxDiffChars: number;
+  reviewTools: string[];
+  fixerTools: string[];
+  timeoutMinutes: number;
+  maxModelCalls: (maxFixRounds: number, applyFixes: boolean) => number;
+  defaultApplyFixes: boolean;
+  defaultFixSeverity: FixSeverityPolicy;
+  evidenceCheck: boolean;
+  blindVerification: boolean;
+  lightVerification: boolean;
+  finalReview: boolean;
+  structuredThinking: ThinkingLevel;
+  compactPrompts: boolean;
+}
 type LoopStatus = "clean" | "findings" | "policy_complete" | "no_progress" | "budget_exhausted" | "change_limit" | "validation_failed";
 
 interface ValidationResult {
@@ -45,6 +66,7 @@ interface Finding {
 }
 
 interface ReviewInput {
+  profile?: ExecutionProfile;
   files?: string[];
   task?: string;
   reviewRules?: string;
@@ -168,13 +190,13 @@ function toRepoPaths(root: string, cwd: string, files: string[] = []): string[] 
   });
 }
 
-function collectUntrackedPatches(root: string, paths: string[]): string[] {
+function collectUntrackedPatches(root: string, paths: string[], contextLines: number): string[] {
   const args = ["ls-files", "--others", "--exclude-standard"];
   if (paths.length) args.push("--", ...paths);
   const files = git(root, args).split(/\r?\n/).filter(Boolean);
   return files.flatMap((file) => {
     try {
-      return [git(root, ["diff", "--no-index", "--no-ext-diff", "--unified=40", "--", "/dev/null", file])];
+      return [git(root, ["diff", "--no-index", "--no-ext-diff", `--unified=${contextLines}`, "--", "/dev/null", file])];
     } catch (error: any) {
       return error?.stdout ? [String(error.stdout)] : [];
     }
@@ -185,14 +207,15 @@ export function collectGitDiff(cwd: string, input: ReviewInput, truncate = true)
   const root = repoRoot(cwd);
   const paths = toRepoPaths(root, cwd, input.files);
   const pathArgs = paths.length ? ["--", ...paths] : [];
+  const contextLines = input.profile === "local" || input.mode === "light" ? 15 : 40;
   const sections: string[] = [];
   try {
-    sections.push(git(root, ["diff", "--no-ext-diff", "--find-renames", "--unified=40", input.base?.trim() || "HEAD", ...pathArgs]));
+    sections.push(git(root, ["diff", "--no-ext-diff", "--find-renames", `--unified=${contextLines}`, input.base?.trim() || "HEAD", ...pathArgs]));
   } catch {
-    sections.push(git(root, ["diff", "--no-ext-diff", "--find-renames", "--unified=40", ...pathArgs]));
-    sections.push(git(root, ["diff", "--cached", "--no-ext-diff", "--find-renames", "--unified=40", ...pathArgs]));
+    sections.push(git(root, ["diff", "--no-ext-diff", "--find-renames", `--unified=${contextLines}`, ...pathArgs]));
+    sections.push(git(root, ["diff", "--cached", "--no-ext-diff", "--find-renames", `--unified=${contextLines}`, ...pathArgs]));
   }
-  sections.push(...collectUntrackedPatches(root, paths));
+  sections.push(...collectUntrackedPatches(root, paths, contextLines));
   const diff = sections.filter(Boolean).join("\n").trim();
   if (!diff) throw new Error(paths.length ? "No Git changes found for the selected files" : "No Git changes found");
   if (!truncate) return diff;
@@ -318,7 +341,91 @@ function selectFindings(findings: Finding[], policy: FixSeverityPolicy): Finding
   return findings.filter((finding) => ranks[finding.severity] >= minimum);
 }
 
-function reviewPrompt(input: ReviewInput, diff: string, purpose = "initial review"): string {
+function resolveProfile(mode: ReviewMode, input: ReviewInput): ReviewProfile {
+  const maxFixRounds = input.maxIterations ?? 1;
+  const applyFixes = input.applyFixes ?? true;
+  switch (mode) {
+    case "light":
+      return {
+        maxDiffChars: LIGHT_MAX_DIFF_CHARS,
+        reviewTools: LIGHT_REVIEW_TOOLS,
+        fixerTools: LIGHT_FIXER_TOOLS,
+        timeoutMinutes: 5,
+        maxModelCalls: (rounds, fixes) => 1 + (fixes ? rounds * 2 : 0) + 1,
+        defaultApplyFixes: true,
+        defaultFixSeverity: "medium_and_above",
+        evidenceCheck: false,
+        blindVerification: false,
+        lightVerification: fixes,
+        finalReview: false,
+        structuredThinking: "off",
+        compactPrompts: true,
+      };
+    case "strict":
+      return {
+        maxDiffChars: DEFAULT_MAX_DIFF_CHARS,
+        reviewTools: REVIEW_TOOLS,
+        fixerTools: ["read", "grep", "find", "ls", "edit", "write", "bash"],
+        timeoutMinutes: 10,
+        maxModelCalls: (_rounds, _fixes) => 2 + (2 * maxFixRounds) + 2,
+        defaultApplyFixes: true,
+        defaultFixSeverity: "all",
+        evidenceCheck: true,
+        blindVerification: true,
+        lightVerification: false,
+        finalReview: true,
+        structuredThinking: "minimal",
+        compactPrompts: false,
+      };
+    case "fast":
+    default:
+      return {
+        maxDiffChars: DEFAULT_MAX_DIFF_CHARS,
+        reviewTools: REVIEW_TOOLS,
+        fixerTools: ["read", "grep", "find", "ls", "edit", "write", "bash"],
+        timeoutMinutes: 10,
+        maxModelCalls: (_rounds, _fixes) => 2 + (2 * maxFixRounds),
+        defaultApplyFixes: true,
+        defaultFixSeverity: "all",
+        evidenceCheck: false,
+        blindVerification: true,
+        lightVerification: false,
+        finalReview: false,
+        structuredThinking: "minimal",
+        compactPrompts: false,
+      };
+  }
+}
+
+function applyProfileDefaults(input: ReviewInput): { mode: ReviewMode; profile: ReviewProfile; effective: ReviewInput } {
+  const mode = input.profile === "local" ? "light" : (input.mode ?? "fast");
+  const profile = resolveProfile(mode, input);
+  const effective: ReviewInput = {
+    ...input,
+    mode,
+    maxDiffChars: input.maxDiffChars ?? profile.maxDiffChars,
+    timeoutMinutes: input.timeoutMinutes ?? profile.timeoutMinutes,
+    fixSeverity: input.fixSeverity ?? profile.defaultFixSeverity,
+    applyFixes: input.applyFixes ?? profile.defaultApplyFixes,
+  };
+  effective.maxModelCalls = input.maxModelCalls
+    ?? profile.maxModelCalls(input.maxIterations ?? 1, effective.applyFixes ?? profile.defaultApplyFixes);
+  return { mode, profile, effective };
+}
+
+function reviewPrompt(input: ReviewInput, diff: string, purpose = "initial review", compact = false): string {
+  if (compact) {
+    return [
+      `Purpose: ${purpose}`,
+      input.task?.trim() ? `Task: ${input.task.trim()}` : "",
+      input.reviewRules?.trim() ? `Rules:\n${input.reviewRules.trim()}` : "",
+      "Review the Git diff. Use read/grep only when needed to confirm a concrete bug. No style nitpicks or speculation.",
+      "Return JSON only: {\"findings\":[{\"id\":\"F-001\",\"severity\":\"critical|high|medium|low\",\"confidence\":0.0,\"title\":\"\",\"file\":\"path\",\"line\":1,\"evidence\":\"\",\"impact\":\"\",\"fix\":\"\"}]}",
+      "Use {\"findings\":[]} if clean.",
+      "\n--- GIT DIFF ---\n",
+      diff,
+    ].filter(Boolean).join("\n");
+  }
   return [
     `Purpose: ${purpose}`,
     `Task context: ${input.task?.trim() || "Review current changes"}`,
@@ -332,7 +439,17 @@ function reviewPrompt(input: ReviewInput, diff: string, purpose = "initial revie
   ].filter(Boolean).join("\n");
 }
 
-function fixerPrompt(input: ReviewInput, diff: string, findings: Finding[], allowedFiles: string[]): string {
+function fixerPrompt(input: ReviewInput, diff: string, findings: Finding[], allowedFiles: string[], compact = false): string {
+  if (compact) {
+    return [
+      input.task?.trim() ? `Task: ${input.task.trim()}` : "",
+      input.reviewRules?.trim() ? `Rules:\n${input.reviewRules.trim()}` : "",
+      `Edit only these files:\n${allowedFiles.join("\n")}`,
+      "Fix only the listed findings. Keep unrelated diff hunks. Do not stage or commit.",
+      `\n--- FINDINGS ---\n${JSON.stringify(findings, null, 2)}`,
+      `\n--- CURRENT DIFF ---\n${diff}`,
+    ].filter(Boolean).join("\n");
+  }
   return [
     `Task context: ${input.task?.trim() || "Fix reviewed changes"}`,
     input.reviewRules?.trim() ? `User constraints:\n${input.reviewRules.trim()}` : "",
@@ -341,6 +458,17 @@ function fixerPrompt(input: ReviewInput, diff: string, findings: Finding[], allo
     "Return a concise summary of edits and validation.",
     `\n--- CONFIRMED FINDINGS ---\n${JSON.stringify(findings, null, 2)}`,
     `\n--- CURRENT DIFF ---\n${diff}`,
+  ].filter(Boolean).join("\n");
+}
+
+function lightVerifyPrompt(input: ReviewInput, diff: string, findings: Finding[]): string {
+  const claims = findings.map(({ id, title, file, line }) => ({ id, title, file, line }));
+  return [
+    "For each finding, decide whether the bug still exists in the current diff.",
+    "Return JSON only: {\"results\":[{\"id\":\"F-001\",\"verdict\":\"resolved|unresolved\",\"evidence\":\"brief reason\"}]}",
+    input.reviewRules?.trim() ? `Rules:\n${input.reviewRules.trim()}` : "",
+    `\n--- FINDINGS ---\n${JSON.stringify(claims)}`,
+    `\n--- GIT DIFF ---\n${diff}`,
   ].filter(Boolean).join("\n");
 }
 
@@ -358,21 +486,26 @@ function verifyPrompt(input: ReviewInput, diff: string, findings: Finding[]): st
 }
 
 const REVIEWER_SYSTEM = "You are a senior code reviewer. Verify repository contracts with tools before reporting findings. Prefer missing a weak suspicion over inventing a false positive.";
+const REVIEWER_SYSTEM_LIGHT = "Code reviewer for local models. Report only concrete bugs confirmed from the diff or quick read/grep checks. Prefer missing a weak issue over a false positive. JSON only.";
 const FIXER_SYSTEM = "You are a senior engineer. Implement only confirmed findings, keep the patch narrow, preserve user changes, and validate behavior.";
+const FIXER_SYSTEM_LIGHT = "Apply only the listed fixes. Keep the patch minimal and preserve unrelated changes.";
 const VERIFIER_SYSTEM = "You are an independent software verification engineer. Judge only current-code evidence. Never trust another agent's conclusion, never infer success from an attempted edit, and mark insufficient evidence inconclusive.";
+const LIGHT_VERIFIER_SYSTEM = "Check whether each listed finding still applies to the current diff. JSON only.";
 
 async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | undefined, stage: (text: string) => void): Promise<LoopResult> {
   const loopStartedAt = Date.now();
   const stages: Array<{ label: string; durationMs: number }> = [];
-  const mode = input.mode ?? "fast";
-  const maxFixRounds = input.maxIterations ?? 1;
-  const maxCalls = input.maxModelCalls ?? (2 + (2 * maxFixRounds) + (mode === "strict" ? 2 : 0));
-  const timeoutMs = (input.timeoutMinutes ?? 10) * 60_000;
-  const maxLines = input.maxChangedLines ?? 2_000;
-  const validationCommands = input.validationCommands?.map((command) => command.trim()).filter(Boolean) ?? [];
-  const validationTimeoutMs = (input.validationTimeoutMinutes ?? 5) * 60_000;
-  const policy = input.fixSeverity ?? "all";
-  const allowedFiles = changedFiles(cwd, input);
+  const { mode, profile, effective } = applyProfileDefaults(input);
+  const maxFixRounds = effective.maxIterations ?? 1;
+  const maxCalls = effective.maxModelCalls ?? profile.maxModelCalls(maxFixRounds, effective.applyFixes ?? profile.defaultApplyFixes);
+  const timeoutMs = (effective.timeoutMinutes ?? profile.timeoutMinutes) * 60_000;
+  const maxLines = effective.maxChangedLines ?? (mode === "light" ? 500 : 2_000);
+  const validationCommands = effective.validationCommands?.map((command) => command.trim()).filter(Boolean) ?? [];
+  const validationTimeoutMs = (effective.validationTimeoutMinutes ?? 5) * 60_000;
+  const policy = effective.fixSeverity ?? profile.defaultFixSeverity;
+  const allowedFiles = changedFiles(cwd, effective);
+  const reviewerSystem = profile.compactPrompts ? REVIEWER_SYSTEM_LIGHT : REVIEWER_SYSTEM;
+  const fixerSystem = profile.compactPrompts ? FIXER_SYSTEM_LIGHT : FIXER_SYSTEM;
   let modelCalls = 0;
   let fixRounds = 0;
   let rollbacks = 0;
@@ -393,7 +526,7 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     systemPrompt: string,
     tools: string[],
     model?: string,
-    thinkingLevel?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+    thinkingLevel?: ThinkingLevel,
   ) => {
     if (modelCalls >= maxCalls) throw new Error("MODEL_CALL_BUDGET_EXHAUSTED");
     modelCalls++;
@@ -414,7 +547,7 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   const structuredCall = async (label: string, prompt: string, systemPrompt: string, tools: string[], model?: string): Promise<any> => {
     let response = "";
     try {
-      response = await call(label, prompt, systemPrompt, tools, model);
+      response = await call(label, prompt, systemPrompt, tools, model, profile.structuredThinking);
       return jsonFromResponse(response);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -435,18 +568,30 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
     }
   };
 
-  const initialDiff = collectGitDiff(cwd, input);
-  let findings = normalizeFindings((await structuredCall("Reviewing", reviewPrompt(input, initialDiff), REVIEWER_SYSTEM, REVIEW_TOOLS)).findings);
+  const initialDiff = collectGitDiff(cwd, effective);
+  let findings = normalizeFindings((
+    await structuredCall(
+      "Reviewing",
+      reviewPrompt(effective, initialDiff, "initial review", profile.compactPrompts),
+      reviewerSystem,
+      profile.reviewTools,
+    )
+  ).findings);
   if (!findings.length) return finish({ status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] });
 
-  if (mode === "strict") {
-    const evidencePrompt = reviewPrompt(input, initialDiff, `evidence check for these candidate findings:\n${JSON.stringify(findings, null, 2)}`);
-    findings = normalizeFindings((await structuredCall("Checking evidence", evidencePrompt, REVIEWER_SYSTEM, REVIEW_TOOLS)).findings);
+  if (profile.evidenceCheck) {
+    const evidencePrompt = reviewPrompt(
+      effective,
+      initialDiff,
+      `evidence check for these candidate findings:\n${JSON.stringify(findings, null, 2)}`,
+      profile.compactPrompts,
+    );
+    findings = normalizeFindings((await structuredCall("Checking evidence", evidencePrompt, reviewerSystem, profile.reviewTools)).findings);
     if (!findings.length) return finish({ status: "clean", mode, modelCalls, fixRounds, findings: [], unresolved: [] });
   }
 
   const selected = selectFindings(findings, policy);
-  if (!(input.applyFixes ?? true)) return finish({ status: "findings", mode, modelCalls, fixRounds, findings, unresolved: findings });
+  if (!(effective.applyFixes ?? profile.defaultApplyFixes)) return finish({ status: "findings", mode, modelCalls, fixRounds, findings, unresolved: findings });
   if (!selected.length) return finish({ status: "policy_complete", mode, modelCalls, fixRounds, findings, unresolved: findings });
 
   const baseline = validationCommands.length
@@ -455,10 +600,10 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
   if (baseline) validation.push(baseline);
 
   let unresolved = selected;
-  let previousFingerprint = createHash("sha256").update(collectGitDiff(cwd, input, false)).digest("hex");
+  let previousFingerprint = createHash("sha256").update(collectGitDiff(cwd, effective, false)).digest("hex");
   for (let round = 1; round <= maxFixRounds && unresolved.length; round++) {
     fixRounds = round;
-    const before = collectGitDiff(cwd, input);
+    const before = collectGitDiff(cwd, effective);
     const snapshot = captureRoundSnapshot(cwd, changedFiles(cwd, {}));
     const rollback = () => {
       restoreRoundSnapshot(snapshot, changedFiles(cwd, {}));
@@ -466,7 +611,12 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
       stage(`Fixing round ${round} | rolled back to pre-round state`);
     };
     try {
-      await call(`Fixing round ${round}`, fixerPrompt(input, before, unresolved, allowedFiles), FIXER_SYSTEM, ["read", "grep", "find", "ls", "edit", "write", "bash"]);
+      await call(
+        `Fixing round ${round}`,
+        fixerPrompt(effective, before, unresolved, allowedFiles, profile.compactPrompts),
+        fixerSystem,
+        profile.fixerTools,
+      );
     } catch (error) {
       rollback();
       throw error;
@@ -478,12 +628,12 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
       rollback();
       return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Rolled back fixer changes outside the initial diff: ${outside.join(", ")}` });
     }
-    if (changedLineCount(cwd, input) > maxLines) {
+    if (changedLineCount(cwd, effective) > maxLines) {
       rollback();
       return finish({ status: "change_limit", mode, modelCalls, fixRounds, findings, unresolved, summary: `Rolled back fixer diff exceeding ${maxLines} changed lines` });
     }
 
-    const fullDiff = collectGitDiff(cwd, input, false);
+    const fullDiff = collectGitDiff(cwd, effective, false);
     const currentFingerprint = createHash("sha256").update(fullDiff).digest("hex");
     if (currentFingerprint === previousFingerprint) return finish({ status: "no_progress", mode, modelCalls, fixRounds, findings, unresolved });
     previousFingerprint = currentFingerprint;
@@ -502,28 +652,55 @@ async function runLoop(cwd: string, input: ReviewInput, signal: AbortSignal | un
       }
     }
 
-    const verificationResponse = await structuredCall(
-      "Independent verification",
-      verifyPrompt(input, collectGitDiff(cwd, input), unresolved),
-      VERIFIER_SYSTEM,
-      ["read", "grep"],
-      input.verifierModel,
-    );
-    const verdicts = new Set(["resolved", "unresolved", "inconclusive"]);
-    const parsedResults: VerificationResult[] = Array.isArray(verificationResponse.results)
-      ? verificationResponse.results.filter((result: any) => result?.id && verdicts.has(result?.verdict) && result?.evidence)
-      : [];
-    const results = unresolved.map((finding) => parsedResults.find((result) => result.id === finding.id) ?? {
-      id: finding.id,
-      verdict: "inconclusive" as const,
-      evidence: "Verifier omitted or malformed this finding result.",
-    });
-    verificationRuns.push({ round, results });
-    unresolved = unresolved.filter((finding) => !results.some((result) => result.id === finding.id && result.verdict === "resolved"));
+    if (profile.lightVerification) {
+      const verificationResponse = await structuredCall(
+        "Post-fix check",
+        lightVerifyPrompt(effective, collectGitDiff(cwd, effective), unresolved),
+        LIGHT_VERIFIER_SYSTEM,
+        profile.reviewTools,
+      );
+      const verdicts = new Set(["resolved", "unresolved"]);
+      const parsedResults: VerificationResult[] = Array.isArray(verificationResponse.results)
+        ? verificationResponse.results.filter((result: any) => result?.id && verdicts.has(result?.verdict) && result?.evidence)
+        : [];
+      const results = unresolved.map((finding) => parsedResults.find((result) => result.id === finding.id) ?? {
+        id: finding.id,
+        verdict: "unresolved" as const,
+        evidence: "Post-fix check omitted or malformed this finding result.",
+      });
+      verificationRuns.push({ round, results });
+      unresolved = unresolved.filter((finding) => !results.some((result) => result.id === finding.id && result.verdict === "resolved"));
+    } else if (profile.blindVerification) {
+      const verificationResponse = await structuredCall(
+        "Independent verification",
+        verifyPrompt(effective, collectGitDiff(cwd, effective), unresolved),
+        VERIFIER_SYSTEM,
+        ["read", "grep"],
+        effective.verifierModel,
+      );
+      const verdicts = new Set(["resolved", "unresolved", "inconclusive"]);
+      const parsedResults: VerificationResult[] = Array.isArray(verificationResponse.results)
+        ? verificationResponse.results.filter((result: any) => result?.id && verdicts.has(result?.verdict) && result?.evidence)
+        : [];
+      const results = unresolved.map((finding) => parsedResults.find((result) => result.id === finding.id) ?? {
+        id: finding.id,
+        verdict: "inconclusive" as const,
+        evidence: "Verifier omitted or malformed this finding result.",
+      });
+      verificationRuns.push({ round, results });
+      unresolved = unresolved.filter((finding) => !results.some((result) => result.id === finding.id && result.verdict === "resolved"));
+    }
   }
 
-  if (mode === "strict" && !unresolved.length) {
-    const finalFindings = normalizeFindings((await structuredCall("Final review", reviewPrompt(input, collectGitDiff(cwd, input), "final regression review"), REVIEWER_SYSTEM, REVIEW_TOOLS)).findings);
+  if (profile.finalReview && !unresolved.length) {
+    const finalFindings = normalizeFindings((
+      await structuredCall(
+        "Final review",
+        reviewPrompt(effective, collectGitDiff(cwd, effective), "final regression review", profile.compactPrompts),
+        reviewerSystem,
+        profile.reviewTools,
+      )
+    ).findings);
     if (finalFindings.length) return finish({ status: "findings", mode, modelCalls, fixRounds, findings, unresolved: finalFindings });
   }
 
@@ -570,6 +747,7 @@ function parseCommand(args: string): ReviewInput {
     const token = tokens[i];
     const value = tokens[i + 1];
     if (token === "--severity" && value) { input.fixSeverity = value as FixSeverityPolicy; i++; }
+    else if (token === "--profile" && value) { input.profile = value as ExecutionProfile; i++; }
     else if (token === "--mode" && value) { input.mode = value as ReviewMode; i++; }
     else if (token === "--iterations" && value) { input.maxIterations = Number(value); i++; }
     else if (token === "--max-calls" && value) { input.maxModelCalls = Number(value); i++; }
@@ -580,6 +758,7 @@ function parseCommand(args: string): ReviewInput {
     else if (token === "--validation-timeout" && value) { input.validationTimeoutMinutes = Number(value); i++; }
     else if (token === "--verifier-model" && value) { input.verifierModel = value; i++; }
     else if (token === "--review-only") input.applyFixes = false;
+    else if (token === "--apply-fixes") input.applyFixes = true;
     else if (token.startsWith("--")) throw new Error(`Unknown option: ${token}`);
     else files.push(...token.split(",").filter(Boolean));
   }
@@ -596,6 +775,7 @@ export function registerCodeReviewLoop(pi: ExtensionAPI): void {
     description: "Runs structured Git-diff review, constrained fixes, and targeted verification.",
     parameters: Type.Object({
       task: Type.Optional(Type.String()),
+      profile: Type.Optional(Type.Union([Type.Literal("standard"), Type.Literal("local")])),
       reviewRules: Type.Optional(Type.String()),
       files: Type.Optional(Type.Array(Type.String())),
       base: Type.Optional(Type.String()),
@@ -603,7 +783,7 @@ export function registerCodeReviewLoop(pi: ExtensionAPI): void {
       maxIterations: Type.Optional(Type.Integer({ minimum: 1, maximum: 2, default: 1 })),
       applyFixes: Type.Optional(Type.Boolean()),
       fixSeverity: Type.Optional(Type.Union([Type.Literal("all"), Type.Literal("medium_and_above"), Type.Literal("critical_only")])),
-      mode: Type.Optional(Type.Union([Type.Literal("fast"), Type.Literal("strict")])),
+      mode: Type.Optional(Type.Union([Type.Literal("fast"), Type.Literal("strict"), Type.Literal("light")])),
       maxModelCalls: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
       timeoutMinutes: Type.Optional(Type.Number({ minimum: 1, maximum: 30 })),
       maxChangedLines: Type.Optional(Type.Integer({ minimum: 1, maximum: 20_000 })),

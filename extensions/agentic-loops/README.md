@@ -6,6 +6,32 @@ An extensible Pi extension for workflows driven by specialized sub-agents.
 
 The code-review loop works on staged, unstaged, and untracked Git changes. It uses structured findings with stable IDs, severity, confidence, and verified evidence.
 
+### Local profile
+
+Tuned for medium local models (for example Qwen 3.6). It uses smaller diffs, compact prompts, thinking disabled on structured calls, and a narrower tool set while preserving the review/fix/check workflow.
+
+```text
+compact diff review -> fix -> compact post-fix check
+```
+
+```text
+/code-review-loop --profile local
+/code-review-loop --profile local --severity critical_only
+/agentic-loop code-review --profile local -- src/service/foo.php
+```
+
+Local defaults:
+
+- diff cap: 40k characters (override with tool `maxDiffChars`)
+- severity filter: `medium_and_above`
+- one fix round; use `--review-only` to disable edits
+- tools: reviewer `read/grep`; fixer `read/grep/edit/write` (no bash)
+- model-call budget: 2 for review-only, 4 with one fix round (+ recovery within budget)
+- timeout: 5 minutes per sub-agent
+- no blind verifier, evidence pass, or final regression review
+
+`--mode light` remains as a compatibility alias for `--profile local`.
+
 ### Fast mode
 
 Default workflow with one fix round and three model calls:
@@ -41,10 +67,12 @@ The default model-call budget reserves one call for structured-output recovery. 
 
 ### Options
 
-- `--mode fast|strict` (default: `fast`)
+- `--mode light|fast|strict` (default: `fast`)
+- `--profile standard|local` (default: `standard`)
 - `--severity all|medium_and_above|critical_only` (default: `all`)
 - `--iterations 1|2` (default: `1`)
 - `--review-only`
+- `--apply-fixes` explicitly enable fix rounds after `--review-only`
 - `--base <git-ref>`
 - `--max-calls <number>`
 - `--timeout <minutes>` per sub-agent
@@ -58,7 +86,7 @@ Tool parameters mirror these options:
 
 ```text
 code_review_loop(
-  task?, reviewRules?, files?, base?, maxDiffChars?,
+  task?, profile?, reviewRules?, files?, base?, maxDiffChars?,
   maxIterations?, applyFixes?, fixSeverity?, mode?,
   maxModelCalls?, timeoutMinutes?, maxChangedLines?,
   validationCommands?, validationTimeoutMinutes?, verifierModel?
