@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Guided implementation and Git-diff code review workflows for Pi",
   "scripts": {
-    "test": "node extensions/agentic-loops/guided/workflow.test.ts"
+    "test": "node --experimental-strip-types extensions/agentic-loops/guided/workflow.test.ts && node --experimental-strip-types extensions/agentic-loops/loops/update-mcp.test.ts"
   },
   "keywords": [
     "pi-package",

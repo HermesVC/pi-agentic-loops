@@ -896,10 +896,15 @@ export function registerCodeReviewLoop(pi: ExtensionAPI): void {
 
   pi.registerCommand("code-review-loop", { description: "Review changes: /code-review-loop [options] [files] -- review rules", handler: sendReview });
   pi.registerCommand("agentic-loop", {
-    description: "Run a loop: /agentic-loop code-review [options] [files] -- review rules",
+    description: "Run a loop: /agentic-loop code-review|update-mcp [options]",
     handler: async (args, ctx) => {
       const [name, ...rest] = args.trim().split(/\s+/);
-      if (name !== "code-review") return ctx.ui.notify("Usage: /agentic-loop code-review [options]", "warning");
+      if (name === "update-mcp") {
+        const { sendUpdateMcpLoopCommand } = await import("./update-mcp.ts");
+        await sendUpdateMcpLoopCommand(pi, rest.join(" "), ctx);
+        return;
+      }
+      if (name !== "code-review") return ctx.ui.notify("Usage: /agentic-loop code-review|update-mcp [options]", "warning");
       await sendReview(rest.join(" "), ctx);
     },
   });
